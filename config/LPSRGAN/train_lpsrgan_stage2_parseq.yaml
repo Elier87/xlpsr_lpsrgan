@@ -1,0 +1,95 @@
+model:
+  name: lpsrgan
+  args:
+    num_blocks: 3
+    dropout_prob: 0.5
+
+model_ocr:
+  name: parseq_ocr
+  args:
+    hub_repo: baudm/parseq
+    model_name: parseq
+    pretrained: True
+    load: null
+    img_size: [32, 128]
+    source: github
+
+optimizer_g:
+  name: adam
+  args:
+    lr: 1.e-4
+    betas: [0.5, 0.999]
+
+optimizer_d:
+  name: adam
+  args:
+    lr: 1.e-4
+    betas: [0.5, 0.999]
+
+func_train: lpsrgan_train
+func_val: lpsrgan_val
+training_stage: gan
+tag_view: stage2_parseq
+visualize_interval: 0
+ocr_supervision_weight: 0.0
+
+train_dataset:
+  dataset:
+    name: paired_image
+    args:
+      path_split: ./split_all_example.txt
+      phase: training
+  wrapper:
+    name: lpsrgan
+    args:
+      imgW: 48
+      imgH: 16
+      aug: True
+      image_aspect_ratio: 3
+      background: (127, 127, 127)
+      rectify: False
+  batch: 16
+
+val_dataset:
+  dataset:
+    name: paired_image
+    args:
+      path_split: ./split_all_example.txt
+      phase: validation
+  wrapper:
+    name: lpsrgan
+    args:
+      imgW: 48
+      imgH: 16
+      aug: False
+      image_aspect_ratio: 3
+      background: (127, 127, 127)
+      rectify: False
+  batch: 16
+
+loss:
+  name: lpsrganLoss
+  args:
+    pixel_weight: 1.0
+    perceptual_weight: 0.1
+    adversarial_weight: 0.005
+    use_perceptual: True
+    use_ocr: False
+    ocr_weight: 0.0
+    load: null
+
+early_stopper:
+  patience: 50
+  min_delta: 0
+  counter: 0
+
+reduce_on_plateau:
+  mode: min
+  factor: 0.5
+  patience: 10
+  min_lr: 1.e-7
+  verbose: True
+
+epoch_max: 300
+epoch_save: 50
+resume: null

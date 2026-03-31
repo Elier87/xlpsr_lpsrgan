@@ -6,14 +6,16 @@ model:
     dropout_prob: 0.5
 
 model_ocr:
-  name: parseq_ocr
+  name: gplpr_ocr
   args:
-    hub_repo: baudm/parseq
-    model_name: parseq
-    pretrained: True
-    load: null
-    img_size: [32, 128]
-    source: github
+    load: /home/re6141029/XLPSR/gplpr/ckpt/PKU.pth
+    alphabet: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    nc: 3
+    K: 7
+    isSeqModel: True
+    head: 2
+    inner: 256
+    isl2Norm: True
 
 test_dataset:
   dataset:

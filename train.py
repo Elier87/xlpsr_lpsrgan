@@ -113,6 +113,19 @@ def _log_model_summary(model):
         log('model: #struct={}'.format(model))
 
 
+def _prepare_ocr_model():
+    ocr_spec = config.get('model_ocr')
+    if ocr_spec is None:
+        return None
+
+    model_ocr = models.make(ocr_spec)
+    if model_ocr is None:
+        return None
+    if hasattr(model_ocr, 'freeze'):
+        model_ocr.freeze()
+    return model_ocr.cuda()
+
+
 def prepare_training():
     if config.get('resume') is not None:
         sv_file = torch.load(config['resume'], map_location='cpu')
@@ -191,6 +204,7 @@ def main(config_, save_path):
     log, writer = utils.make_log_writer(save_path)
     train_loader, val_loader = make_dataloaders()
     model, optimizer, epoch_start, lr_scheduler, early_stopper = prepare_training()
+    model_ocr = _prepare_ocr_model()
     train = train_funcs.make(config['func_train'])
     validation = train_funcs.make(config['func_val'])
     loss_fn = losses.make(config['loss'])
@@ -221,13 +235,17 @@ def main(config_, save_path):
             log_info.append(f"lr:{optimizer.param_groups[0]['lr']}")
 
         config['epoch'] = epoch
-        train_loss = train(train_loader, model, optimizer, loss_fn, [], config)
-        val_loss, _ = validation(val_loader, model, loss_fn, [], config)
+        train_loss = train(train_loader, model, optimizer, loss_fn, [], config, model_ocr)
+        val_loss, val_report = validation(val_loader, model, loss_fn, [], config, model_ocr)
 
         writer.add_scalar('train_loss', train_loss, epoch)
         writer.add_scalar('val_loss', val_loss, epoch)
         log_info.append(f'train: loss={train_loss:.4f}')
         log_info.append(f'val: loss={val_loss:.4f}')
+        if isinstance(val_report, dict):
+            for key, value in val_report.items():
+                writer.add_scalar(f'val_{key}', value, epoch)
+                log_info.append(f'{key}:{value:.4f}')
 
         if lr_scheduler is not None:
             lr_scheduler.step(val_loss)

@@ -4,25 +4,18 @@ import cv2
 import yaml
 import torch
 import models
-import copy
 import pandas as pd
-import datasets
 import argparse
 import numpy as np
 import torch.nn as nn
-import tensorflow as tf
-from collections import Counter
 from tqdm import tqdm
-from PIL import Image
 from pathlib import Path
 import Levenshtein
 from train import make_dataloader
 from collections import defaultdict
 
-from matplotlib import pyplot as plt
 from utils_test import majority_vote_by_character, select_highest_confidence_string, select_most_frequent_string
 import torchvision.transforms as T
-import kornia as K
 torch.autograd.set_detect_anomaly(True)
 torch.cuda.empty_cache()
 import torch.nn.functional as F
@@ -53,8 +46,10 @@ def prepare_testing():
     if n_gpus > 1 and model_sr is not None:
         model_sr = nn.parallel.DataParallel(model_sr)
 
-    if config['model_ocr']['name'] == 'ocr':
+    if config['model_ocr']['name'] in {'parseq_ocr', 'gplpr_ocr', 'ocr'}:
         model_ocr = models.make(config['model_ocr']).cuda()
+        if hasattr(model_ocr, 'freeze'):
+            model_ocr.freeze()
     else:
         ocr_cfg = config['model_ocr']
         ocr_ckpt = torch.load(ocr_cfg['load'])
@@ -306,8 +301,8 @@ def test(test_loader, model_sr, model_ocr, save_path):
             ).cuda()
 
             preds_dict = {
-                'lr': model_ocr.OCR_pred(lr_up),
-                'sr': model_ocr.OCR_pred(imgs_sr)
+                'lr': model_ocr.predict(lr_up),
+                'sr': model_ocr.predict(imgs_sr)
             }
 
             gt = batch['gt'][0]
@@ -315,8 +310,10 @@ def test(test_loader, model_sr, model_ocr, save_path):
             sample_name = sample_path.parent.name
 
             # 預設拿 threshold=1 的結果（你若要改成別的規則再調）
-            pred_lr_raw, conf_lr_raw = preds_dict['lr']
-            pred_sr_raw, conf_sr_raw = preds_dict['sr']
+            pred_lr_raw = preds_dict['lr']['texts']
+            conf_lr_raw = preds_dict['lr']['confidences']
+            pred_sr_raw = preds_dict['sr']['texts']
+            conf_sr_raw = preds_dict['sr']['confidences']
 
             pred_lr = select_most_frequent_string(conf_lr_raw, pred_lr_raw, 1)
             pred_sr = select_most_frequent_string(conf_sr_raw, pred_sr_raw, 1)

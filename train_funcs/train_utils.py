@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from matplotlib import pyplot as plt
 from torchvision import transforms
 from tqdm import tqdm
@@ -95,9 +96,29 @@ def _format_postfix(metrics, extra=None):
     return postfix
 
 
+def _get_ocr_model(args):
+    return args[1] if len(args) > 1 else None
+
+
+def _maybe_add_ocr_supervision(loss, metrics, sr_batch, batch, config, ocr_model):
+    if ocr_model is None:
+        return loss, metrics
+
+    weight = config.get('ocr_supervision_weight', 0.0)
+    if weight <= 0.0:
+        return loss, metrics
+
+    ocr_term = ocr_model.teacher_loss(sr_batch, batch['gt'])
+    loss = loss + weight * ocr_term
+    metrics['ocr_teacher'] = float(ocr_term.detach().item())
+    metrics['total'] = float(loss.detach().item())
+    return loss, metrics
+
+
 @register('lpsrgan_pretrain')
 def lpsrgan_pretrain(train_loader, model, optimizer, loss_fn, confusing_pair, *args):
     config = args[0]
+    ocr_model = _get_ocr_model(args)
     model_g, model_d = _get_model_parts(model)
     optimizer_g, _ = _get_optimizer_parts(optimizer)
 
@@ -111,6 +132,9 @@ def lpsrgan_pretrain(train_loader, model, optimizer, loss_fn, confusing_pair, *a
         config['_loop_step'] = idx + 1
         sr_batch = model_g(batch['lr'].cuda())
         loss_g, metrics, preds = _run_generator_loss(loss_fn, sr_batch, batch, loss_adv=None)
+        loss_g, metrics = _maybe_add_ocr_supervision(
+            loss_g, metrics, sr_batch, batch, config, ocr_model
+        )
 
         optimizer_g.zero_grad()
         loss_g.backward()
@@ -126,6 +150,7 @@ def lpsrgan_pretrain(train_loader, model, optimizer, loss_fn, confusing_pair, *a
 @register('lpsrgan_train')
 def lpsrgan_train(train_loader, model, optimizer, loss_fn, confusing_pair, *args):
     config = args[0]
+    ocr_model = _get_ocr_model(args)
     model_g, model_d = _get_model_parts(model)
     optimizer_g, optimizer_d = _get_optimizer_parts(optimizer)
 
@@ -156,6 +181,9 @@ def lpsrgan_train(train_loader, model, optimizer, loss_fn, confusing_pair, *args
         fake_pred_for_g = model_d(sr_batch)
         loss_adv = torch.mean((fake_pred_for_g - 1) ** 2)
         loss_g, metrics, preds = _run_generator_loss(loss_fn, sr_batch, batch, loss_adv=loss_adv)
+        loss_g, metrics = _maybe_add_ocr_supervision(
+            loss_g, metrics, sr_batch, batch, config, ocr_model
+        )
 
         optimizer_g.zero_grad()
         loss_g.backward()
@@ -172,6 +200,7 @@ def lpsrgan_train(train_loader, model, optimizer, loss_fn, confusing_pair, *args
 @register('lpsrgan_val')
 def lpsrgan_val(val_loader, model, loss_fn, confusing_pair, *args):
     config = args[0]
+    ocr_model = _get_ocr_model(args)
     model_g, model_d = _get_model_parts(model)
 
     model_g.eval()
@@ -179,6 +208,13 @@ def lpsrgan_val(val_loader, model, loss_fn, confusing_pair, *args):
         model_d.eval()
 
     val_losses = []
+    ocr_sr_scores = []
+    ocr_sr_accs = []
+    ocr_sr_char_accs = []
+    ocr_sr_confs = []
+    ocr_lr_scores = []
+    ocr_lr_accs = []
+    ocr_lr_char_accs = []
     pbar = tqdm(val_loader, leave=False, desc='val')
     with torch.no_grad():
         for idx, batch in enumerate(pbar):
@@ -194,7 +230,44 @@ def lpsrgan_val(val_loader, model, loss_fn, confusing_pair, *args):
 
             loss_g, metrics, preds = _run_generator_loss(loss_fn, sr_batch, batch, loss_adv=loss_adv)
             val_losses.append(metrics['total'])
-            _maybe_visualize(batch, sr_batch, config, preds=preds)
-            pbar.set_postfix(_format_postfix(metrics))
 
-    return sum(val_losses) / len(val_losses), []
+            if ocr_model is not None:
+                lr_up = F.interpolate(
+                    batch['lr'].cuda(),
+                    size=(sr_batch.size(2), sr_batch.size(3)),
+                    mode='bilinear',
+                    align_corners=False,
+                )
+                sr_eval = ocr_model.evaluate(sr_batch, batch['gt'])
+                lr_eval = ocr_model.evaluate(lr_up, batch['gt'])
+
+                ocr_sr_scores.append(sr_eval['metrics']['ocr_score'])
+                ocr_sr_accs.append(sr_eval['metrics']['ocr_acc'])
+                ocr_sr_char_accs.append(sr_eval['metrics']['ocr_char_acc'])
+                ocr_sr_confs.append(sr_eval['metrics']['ocr_conf'])
+                ocr_lr_scores.append(lr_eval['metrics']['ocr_score'])
+                ocr_lr_accs.append(lr_eval['metrics']['ocr_acc'])
+                ocr_lr_char_accs.append(lr_eval['metrics']['ocr_char_acc'])
+
+            _maybe_visualize(batch, sr_batch, config, preds=preds)
+            postfix_extra = None
+            if ocr_model is not None and ocr_sr_scores:
+                postfix_extra = {
+                    'ocr_sr': round(ocr_sr_scores[-1], 4),
+                    'ocr_lr': round(ocr_lr_scores[-1], 4),
+                }
+            pbar.set_postfix(_format_postfix(metrics, extra=postfix_extra))
+
+    report = {}
+    if ocr_sr_scores:
+        report = {
+            'ocr_score_sr': float(sum(ocr_sr_scores) / len(ocr_sr_scores)),
+            'ocr_acc_sr': float(sum(ocr_sr_accs) / len(ocr_sr_accs)),
+            'ocr_char_acc_sr': float(sum(ocr_sr_char_accs) / len(ocr_sr_char_accs)),
+            'ocr_conf_sr': float(sum(ocr_sr_confs) / len(ocr_sr_confs)),
+            'ocr_score_lr': float(sum(ocr_lr_scores) / len(ocr_lr_scores)),
+            'ocr_acc_lr': float(sum(ocr_lr_accs) / len(ocr_lr_accs)),
+            'ocr_char_acc_lr': float(sum(ocr_lr_char_accs) / len(ocr_lr_char_accs)),
+        }
+
+    return sum(val_losses) / len(val_losses), report
