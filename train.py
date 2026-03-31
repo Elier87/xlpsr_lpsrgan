@@ -22,7 +22,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 #Set gpu visibility, for debbug purposes
 import os
 #
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 # Enable anomaly detection in PyTorch autograd. Anomaly detection helps in finding operations that
 # are not supported by autograd and can be useful for debugging. It is often used during development

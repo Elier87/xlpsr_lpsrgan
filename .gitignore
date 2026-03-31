@@ -1,0 +1,15 @@
+ckpt/
+dataset_intelbras_1280X960/
+dataset_intelbras_1920x1080/
+results/
+result/
+ufpr-sr/
+xlpsr/
+
+
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dylib

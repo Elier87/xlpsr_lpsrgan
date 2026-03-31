@@ -31,45 +31,35 @@ import time
 from pynvml import *
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+
 def resize_fn(img, size):
     return T.ToTensor()(
         T.Resize(size, T.InterpolationMode.BICUBIC)(T.ToPILImage()(img))
     )
 
 def prepare_testing():
-    # Create a data loader for the test dataset
     test_loader = make_dataloader(config['test_dataset'], tag='test')
-    
-    if config['model'] is not None:
-        # Load the super-resolution (SR) model
-        sv_file = config['model']
-        sv_file = torch.load(sv_file['load'])
 
-        # Create the SR model based on the loaded model specifications
-        model_sr, _ = models.make(sv_file['model'], load_model=True)
-        model_sr.cuda()
+    sr_ckpt = None
+    if config['model'] is not None:
+        sr_cfg = config['model']
+        sr_ckpt = torch.load(sr_cfg['load'])
+        model_sr, _ = models.make(sr_ckpt['model'], load_model=True)
+        model_sr = model_sr.cuda()
     else:
         model_sr = None
-    # Check the number of available GPUs
+
     n_gpus = torch.cuda.device_count()
-    
-    # If multiple GPUs are available, use DataParallel to parallelize the SR model
-    if n_gpus > 1:
+    if n_gpus > 1 and model_sr is not None:
         model_sr = nn.parallel.DataParallel(model_sr)
-    
-    # Load the OCR model based on the configuration
+
     if config['model_ocr']['name'] == 'ocr':
-        model_ocr = models.make(config['model_ocr'])
+        model_ocr = models.make(config['model_ocr']).cuda()
     else:
-        sv_file = config['model_ocr']
-        sv_file = torch.load(sv_file['load'])
-        model_ocr = models.make(sv_file['model'], load_model=True).cuda()
-    
-    # Set the Torch RNG (Random Number Generator) state based on the loaded state
-    state = sv_file['state']
-    torch.set_rng_state(state)
-    
-    # Return the test data loader, the SR model, and the OCR model
+        ocr_cfg = config['model_ocr']
+        ocr_ckpt = torch.load(ocr_cfg['load'])
+        model_ocr = models.make(ocr_ckpt['model'], load_model=True).cuda()
+
     return test_loader, model_sr, model_ocr
 
 def process_results(preds, preds_conf_mean, t, mv_character_results, mv_hc_results, mv_results, res_type):
@@ -213,84 +203,179 @@ def write_mv_character_results_to_csv(table, mv_character_results, mv_dist, mv_p
             # Write DataFrame headers and contents to CSV
             writer.writerow([''] + list(data.columns))  # Column headers with an empty leading cell for row indices
             writer.writerows([[idx] + row.tolist() for idx, row in data.iterrows()])  # Each row with index
+def align_pred_to_gt(pred, gt):
+    pred = pred.strip() if pred is not None else ""
+    gt = gt.strip()
+    L = len(gt)
 
+    pred_chars = list(pred[:L])
+    if len(pred_chars) < L:
+        pred_chars += [""] * (L - len(pred_chars))
+
+    gt_chars = list(gt)
+    return pred_chars, gt_chars
+
+def calc_xlpsr_score_and_acc(pred, gt):
+    pred_chars, gt_chars = align_pred_to_gt(pred, gt)
+
+    score = 0
+    for p, g in zip(pred_chars, gt_chars):
+        if p == "":
+            score += 0
+        elif p == g:
+            score += 2
+        else:
+            score += -1
+
+    acc = int("".join(pred_chars) == gt)
+    return score, acc
+
+def build_conf_filtered_string(pred, conf, threshold):
+    # pred: OCR字串
+    # conf: 平均置信度或單一分數；若不是list，就整串共用
+    if pred is None:
+        return ""
+
+    pred = pred.strip()
+
+    if isinstance(conf, (list, tuple, np.ndarray)):
+        out = []
+        for i, ch in enumerate(pred):
+            c = conf[i] if i < len(conf) else 0.0
+            out.append(ch if c >= threshold else "")
+        return "".join(out)
+    else:
+        # 若只有整串平均信心，低於threshold就整串空白
+        return pred if float(conf) >= threshold else ""
+
+def write_xlpsr_results_to_csv(rows, save_path, filename="xlpsr_eval.csv"):
+    output_path = Path(save_path) / filename
+    header = [
+        "path", "gt",
+        "pred_lr", "pred_sr",
+        "conf_lr", "conf_sr",
+        "score_lr", "score_sr",
+        "acc_lr", "acc_sr"
+    ]
+
+    with output_path.open(mode="w", newline="") as file:
+        writer = csv.writer(file, delimiter=";")
+        writer.writerow(header)
+        for row in rows:
+            writer.writerow([
+                row["path"], row["gt"],
+                row["pred_lr"], row["pred_sr"],
+                row["conf_lr"], row["conf_sr"],
+                row["score_lr"], row["score_sr"],
+                row["acc_lr"], row["acc_sr"],
+            ])
 def test(test_loader, model_sr, model_ocr, save_path):
-    # Set the SR model to evaluation mode
     if model_sr is not None:
         model_sr.eval()
     model_ocr.eval()
-    # Create a progress bar for visualizing the testing progress
+
     pbar = tqdm(test_loader, leave=False, desc='test')
-    # Initialize a list to store predictions
-    preds = []
-    
-    # Create a directory for saving the test result images
     results_path = save_path / Path('imgs')
     results_path.mkdir(parents=True, exist_ok=True)
-    
-    gt = []
-    
+
     timings = []
-    
+    rows = []
+
+    # 低信心視為空白，依你需求自己調
+    conf_threshold = 0.5
+
     with torch.no_grad():
-    # Initialize result storage outside the batch loop to accumulate across batches
-        results_dict_template = {1: [], 3: [], 5: []}
-        mv_character_results = {k: defaultdict(list, copy.deepcopy(results_dict_template)) for k in ['lr', 'hr', 'sr']}
-        mv_hc_results = {k: defaultdict(list, copy.deepcopy(results_dict_template)) for k in ['lr', 'hr', 'sr']}
-        mv_results = {k: defaultdict(list, copy.deepcopy(results_dict_template)) for k in ['lr', 'hr', 'sr']}
-        mv_path_images = []
-        # Loop through batches
         for idx, batch in enumerate(pbar):
-            # Prepare images and move them to GPU
-            imgs_hr = batch['hr'].view(-1, 3, batch['hr'].size(2), batch['hr'].size(3)).cuda()
+            imgs_lr = batch['lr'].view(-1, 3, 16, 48)
+
+            start = time.time()
             if model_sr is not None:
-                imgs_lr = batch['lr'].view(-1, 3, 16, 48)
-                start = time.time()
                 imgs_sr = model_sr(imgs_lr.cuda())
-                timings.append((time.time() - start)*1000)  # Convert to ms
             else:
-                imgs_sr = batch['lr'].view(-1, 3, 32, 96)
-                imgs_lr = batch['lr'].view(-1, 3, 32, 96)
-                imgs_sr = F.interpolate(imgs_sr, size=(imgs_hr.size(2), imgs_hr.size(3)), mode='bilinear', align_corners=False).cuda()
-            
-            # Perform OCR predictions for each resolution
+                imgs_sr = F.interpolate(
+                    imgs_lr.cuda(), size=(32, 96), mode='bilinear', align_corners=False
+                )
+            timings.append((time.time() - start) * 1000)
+
+            # LR baseline：先放大到 SR 同大小再 OCR
+            lr_up = F.interpolate(
+                imgs_lr,
+                size=(imgs_sr.size(2), imgs_sr.size(3)),
+                mode='bilinear',
+                align_corners=False
+            ).cuda()
+
             preds_dict = {
-                'lr': model_ocr.OCR_pred(F.interpolate(imgs_lr, size=(imgs_hr.size(2), imgs_hr.size(3)), mode='bilinear', align_corners=False).cuda()),
-                'hr': model_ocr.OCR_pred(imgs_hr),
+                'lr': model_ocr.OCR_pred(lr_up),
                 'sr': model_ocr.OCR_pred(imgs_sr)
             }
-            gt.append(batch['gt'][0])
-            mv_path_images.append(batch['name'])
-            # For each resolution and threshold, calculate and store results
-            
-            
-            
-            for res_type, (preds, preds_conf_mean) in preds_dict.items():
-            
-                for t in [1, 3, 5]:
-                    process_results(preds, preds_conf_mean, t, mv_character_results, mv_hc_results, mv_results, res_type)
-            
-            img_save_path = results_path / batch['name'][0].parent
+
+            gt = batch['gt'][0]
+            sample_path = Path(batch['name'][0])
+            sample_name = sample_path.parent.name
+
+            # 預設拿 threshold=1 的結果（你若要改成別的規則再調）
+            pred_lr_raw, conf_lr_raw = preds_dict['lr']
+            pred_sr_raw, conf_sr_raw = preds_dict['sr']
+
+            pred_lr = select_most_frequent_string(conf_lr_raw, pred_lr_raw, 1)
+            pred_sr = select_most_frequent_string(conf_sr_raw, pred_sr_raw, 1)
+
+            # 取平均信心（若 OCR 回傳的是 list）
+            if isinstance(conf_lr_raw, (list, tuple, np.ndarray)):
+                conf_lr = float(np.mean(conf_lr_raw)) if len(conf_lr_raw) > 0 else 0.0
+            else:
+                conf_lr = float(conf_lr_raw)
+
+            if isinstance(conf_sr_raw, (list, tuple, np.ndarray)):
+                conf_sr = float(np.mean(conf_sr_raw)) if len(conf_sr_raw) > 0 else 0.0
+            else:
+                conf_sr = float(conf_sr_raw)
+
+            # 低信心 => 空白 => 0分
+            pred_lr_final = build_conf_filtered_string(pred_lr, conf_lr, conf_threshold)
+            pred_sr_final = build_conf_filtered_string(pred_sr, conf_sr, conf_threshold)
+
+            score_lr, acc_lr = calc_xlpsr_score_and_acc(pred_lr_final, gt)
+            score_sr, acc_sr = calc_xlpsr_score_and_acc(pred_sr_final, gt)
+
+            rows.append({
+                "path": sample_name,
+                "gt": gt,
+                "pred_lr": pred_lr_final,
+                "pred_sr": pred_sr_final,
+                "conf_lr": round(conf_lr, 4),
+                "conf_sr": round(conf_sr, 4),
+                "score_lr": score_lr,
+                "score_sr": score_sr,
+                "acc_lr": acc_lr,
+                "acc_sr": acc_sr,
+            })
+
+            img_save_path = results_path / sample_path.parent
             img_save_path.mkdir(parents=True, exist_ok=True)
-            for i, (img_lr, img_sr) in enumerate(zip(imgs_lr, imgs_sr)):
+
+            for i, (img_lr_i, img_sr_i) in enumerate(zip(imgs_lr, imgs_sr)):
                 filename_lr = f"lr-{i+1:03}.png"
                 filename_sr = f"sr-{i+1:03}.png"
-                
-                img_lr = T.ToPILImage()(img_lr)
-                img_sr = T.ToPILImage()(img_sr)
-                img_lr.save(img_save_path / Path(filename_lr))
-                img_sr.save(img_save_path / Path(filename_sr))
-        
-        distance_percentages_mvcp, distance_percentages_hc, distance_percentages_mv, distance_mvcp, distance_hc, distance_mv = calculate_distances_and_percentages(mv_character_results, mv_hc_results, mv_results, gt)
 
-        # Create a DataFrame with the percentage results for each distance type
-        hc_table = create_threshold_table(distance_percentages_hc)
-        mvcp_table = create_threshold_table(distance_percentages_mvcp)
-        mv_table = create_threshold_table(distance_percentages_mv)
-        
-        write_mv_character_results_to_csv(mvcp_table, mv_character_results, distance_mvcp,  mv_path_images, gt, save_path, "MVCP.csv")
-        write_mv_character_results_to_csv(hc_table, mv_hc_results, distance_hc, mv_path_images, gt, save_path, "HC.csv")
-        write_mv_character_results_to_csv(mv_table, mv_results, distance_mv, mv_path_images, gt, save_path, "MV.csv")
+                img_lr_i = T.ToPILImage()(img_lr_i)
+                img_sr_i = T.ToPILImage()(img_sr_i.cpu())
+
+                img_lr_i.save(img_save_path / Path(filename_lr))
+                img_sr_i.save(img_save_path / Path(filename_sr))
+
+    write_xlpsr_results_to_csv(rows, save_path, "xlpsr_eval.csv")
+
+    mean_score_lr = np.mean([r["score_lr"] for r in rows]) if rows else 0.0
+    mean_score_sr = np.mean([r["score_sr"] for r in rows]) if rows else 0.0
+    accu_lr = np.mean([r["acc_lr"] for r in rows]) if rows else 0.0
+    accu_sr = np.mean([r["acc_sr"] for r in rows]) if rows else 0.0
+    mean_time = np.mean(timings) if len(timings) > 0 else 0.0
+
+    print(f"[LR ] mean_score={mean_score_lr:.4f}, accu={accu_lr:.4f}")
+    print(f"[SR ] mean_score={mean_score_sr:.4f}, accu={accu_sr:.4f}")
+    print(f"[SR ] mean_inference_time_ms={mean_time:.2f}")
  
 def main(config_, save_path):
     global config

@@ -1,0 +1,1 @@
+WD272DE;./data/cropped/crops/seq_000;testing

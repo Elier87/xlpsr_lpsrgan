@@ -250,70 +250,66 @@ class SR_paired_images_wrapper_lp(Dataset):
         return pts
     
     def collate_fn(self, datas):
-        lrs = []
-        hrs = []
-        gts = []
+        batch_lrs = []
+        batch_plates = []
         file_name = []
-        
-        target_h = self.imgH  # Target height for padding (e.g., self.imgH for your dataset)
-        target_w = self.imgW  # Target width for padding (e.g., self.imgW for your dataset)
-    
-        
-        for item in datas: 
-            lr_path = random.choice(list(item['imgs'].rglob('lr*.png')))
-            img_lr = self.Open_image(lr_path)
-            
-            hr_path = random.choice(list(item['imgs'].rglob('hr*.png')))
-            img_hr = self.Open_image(hr_path)
-            gt = self.extract_plate_numbers(next(hr_path.parent.rglob('*.txt')), pattern=r'(\w+)')
-            # hr = K.enhance.equalize_clahe(hr, clip_limit=4.0, grid_size=(2, 2))
-            
+
+        for item in datas:
+            lr_imgs = []
+
+            # 支援你現在的 seq_000/000000.png ~ 000009.png
+            paths = sorted(list(item['imgs'].glob('[0-9]*.png')))
+
+            if self.test:
+                paths = paths[:self.in_images]
+            else:
+                paths = [random.choice(paths)]
+
+            # GT 從 plate-*.txt 讀
+            path_lp = next(item['imgs'].rglob('plate-*.txt'))
+            with open(path_lp, "r") as l:
+                plate = l.readlines()[0].strip()
+
+            batch_plates.append(plate)
+            file_name.append(path_lp)
+
             if self.aug is True:
-                # augment = np.random.choice(self.transform, replace = True)
                 rectify_assert = random.random()
             else:
                 rectify_assert = 1.0
-            
-            if self.aug:
-                if rectify_assert < 0.5:
-                    img_lr = self.rectify_img(img_lr, self.get_pts(lr_path), margin=2)
-                    img_hr = self.rectify_img(img_hr, self.get_pts(hr_path), margin=2)
-                
-                # Apply consistent augmentation to both LR and HR images
-                img_lr, img_hr = self.augment_images(
-                        lr_img=img_lr,
-                        hr_img=img_hr,
-                        augmentations=self.transform,
-                        target_h=target_h,
-                        target_w=target_w
-                    )
-            
-            img_lr, _, _, _ = self.pad_with_mask(img_lr, self.ar-0.15, self.ar+0.15, self.background)
-            img_lr = resize_fn(img_lr, (self.imgH, self.imgW))
-            img_hr = K.enhance.equalize_clahe(transforms.ToTensor()(Image.fromarray(img_hr)).unsqueeze(0), clip_limit=4.0, grid_size=(2, 2))
-            img_hr = K.utils.tensor_to_image(img_hr.mul(255.0).byte())
-            img_hr, _, _, _ = self.pad_with_mask(img_hr, self.ar-0.15, self.ar+0.15, self.background)  
-            img_hr = resize_fn(img_hr, (2*self.imgH, 2*self.imgW))
 
-            lrs.append(img_lr)
-            hrs.append(img_hr)
-            gts.append(gt)
-            
-        lr = torch.stack(lrs, dim=0)
-        hr = torch.stack(hrs, dim=0)
+            for lr_path in paths:
+                img_lr = self.Open_image(str(lr_path))
+
+                if self.aug:
+                    if rectify_assert < 0.5 and lr_path.with_suffix('.json').exists():
+                        img_lr = self.rectify_img(img_lr, self.get_pts(lr_path), margin=2)
+
+                img_lr, _, _, _ = self.pad_with_mask(
+                    img_lr, self.ar - 0.15, self.ar + 0.15, self.background
+                )
+                img_lr = resize_fn(img_lr, (self.imgH, self.imgW))
+                lr_imgs.append(img_lr)
+
+            batch_lrs.append(
+                torch.cat(lr_imgs, dim=0) if not self.time_series else torch.stack(lr_imgs)
+            )
+
+        batch_lrs = torch.stack(batch_lrs)
+
+        return {
+            'lr': batch_lrs,
+            'gt': batch_plates,
+            'name': file_name if self.test else None,
+        }
+    
         
-        gt = gts
-        del lrs
-        del hrs
-        del gts
-        if self.test and not self.lbp:
-            return {
-                'lr': lr, 'hr': hr, 'gt': gt, 'name': file_name
-                    }
-        else:
-            return {
-                'lr': lr, 'hr': hr, 'gt': gt
-                }
+        
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        return self.dataset[idx]
     
         
         
@@ -550,80 +546,58 @@ class SR_multi_image(Dataset):
     
     def collate_fn(self, datas):
         batch_lrs = []
-        batch_hrs = []
         batch_plates = []
         file_name = []
-        
-        target_h = self.imgH  # Target height for padding (e.g., self.imgH for your dataset)
-        target_w = self.imgW  # Target width for padding (e.g., self.imgW for your dataset)
 
-        
         for item in datas:
             lr_imgs = []
-            hr_imgs = []
-            paths = sorted(list(item['imgs'].rglob('lr*.png')))
-            
+
+            # 支援你現在的 seq_000/000000.png ~ 000009.png
+            paths = sorted(list(item['imgs'].glob('*.png')))
+
             if self.test:
                 paths = paths[:self.in_images]
-                # print(paths)
             else:
                 paths = [random.choice(paths)]
-                
-           
+
+            # GT 從 plate-*.txt 讀
             path_lp = next(item['imgs'].rglob('plate-*.txt'))
             with open(path_lp, "r") as l:
                 plate = l.readlines()[0].strip()
+
             batch_plates.append(plate)
             file_name.append(path_lp)
-            
+
             if self.aug is True:
-                # augment = np.random.choice(self.transform, replace = True)
                 rectify_assert = random.random()
             else:
                 rectify_assert = 1.0
-            
-            hr = sorted(list(item['imgs'].glob('hr-*.png')))[:self.in_images] if self.test else [random.choice(list(item['imgs'].glob('hr-*.png')))]
-           
-            for lr_path, hr_path in zip(paths, hr):
+
+            for lr_path in paths:
                 img_lr = self.Open_image(str(lr_path))
-                img_hr = self.Open_image(str(hr_path))
-                
+
                 if self.aug:
-                    if rectify_assert < 0.5:
+                    if rectify_assert < 0.5 and lr_path.with_suffix('.json').exists():
                         img_lr = self.rectify_img(img_lr, self.get_pts(lr_path), margin=2)
-                        img_hr = self.rectify_img(img_hr, self.get_pts(hr_path), margin=2)
-                    
-                    # Apply consistent augmentation to both LR and HR images
-                    img_lr, img_hr = self.augment_images(
-                            lr_img=img_lr,
-                            hr_img=img_hr,
-                            augmentations=self.transform,
-                            target_h=target_h,
-                            target_w=target_w
-                        )
-                img_lr, _, _, _ = self.pad_with_mask(img_lr, self.ar - 0.15, self.ar + 0.15, self.background)
+
+                img_lr, _, _, _ = self.pad_with_mask(
+                    img_lr, self.ar - 0.15, self.ar + 0.15, self.background
+                )
                 img_lr = resize_fn(img_lr, (self.imgH, self.imgW))
                 lr_imgs.append(img_lr)
-                
-                img_hr = K.enhance.equalize_clahe(transforms.ToTensor()(Image.fromarray(img_hr)).unsqueeze(0), clip_limit=4.0, grid_size=(2, 2))
-                img_hr = K.utils.tensor_to_image(img_hr.mul(255.0).byte())
-                img_hr, _, _, _ = self.pad_with_mask(img_hr, self.ar - 0.15, self.ar + 0.15, self.background)
-                img_hr = resize_fn(img_hr, (2 * self.imgH, 2 * self.imgW))
-                hr_imgs.append(img_hr)
-                
-            batch_lrs.append(torch.cat(lr_imgs, dim=0) if not self.time_series else torch.stack(lr_imgs))
-            batch_hrs.append(torch.cat(hr_imgs, dim=0) if not self.time_series else torch.stack(hr_imgs))
+
+            batch_lrs.append(
+                torch.cat(lr_imgs, dim=0) if not self.time_series else torch.stack(lr_imgs)
+            )
 
         batch_lrs = torch.stack(batch_lrs)
-        batch_hrs = torch.stack(batch_hrs)
-    
+
         return {
             'lr': batch_lrs,
-            'hr': batch_hrs,
             'gt': batch_plates,
             'name': file_name if self.test else None,
         }
-            
+                
             
     
     def __len__(self):
