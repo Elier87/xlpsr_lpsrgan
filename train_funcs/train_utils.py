@@ -100,6 +100,13 @@ def _get_ocr_model(args):
     return args[1] if len(args) > 1 else None
 
 
+def _get_ocr_input(batch, config):
+    input_key = config.get('ocr_input_key', 'hr')
+    if input_key not in batch:
+        raise KeyError(f'OCR input key "{input_key}" not found in batch')
+    return batch[input_key].cuda()
+
+
 def _maybe_add_ocr_supervision(loss, metrics, sr_batch, batch, config, ocr_model):
     if ocr_model is None:
         return loss, metrics
@@ -108,7 +115,16 @@ def _maybe_add_ocr_supervision(loss, metrics, sr_batch, batch, config, ocr_model
     if weight <= 0.0:
         return loss, metrics
 
-    ocr_term = ocr_model.teacher_loss(sr_batch, batch['gt'])
+    reference_key = config.get('ocr_reference_key', 'hr')
+    reference_images = batch[reference_key].cuda() if reference_key in batch else None
+    ocr_term = ocr_model.teacher_loss(
+        sr_batch,
+        targets=batch.get('gt'),
+        reference_images=reference_images,
+        mode=config.get('ocr_supervision_mode', 'distill'),
+        temperature=config.get('ocr_supervision_temperature', 1.0),
+        confidence_weighted=config.get('ocr_confidence_weighted', True),
+    )
     loss = loss + weight * ocr_term
     metrics['ocr_teacher'] = float(ocr_term.detach().item())
     metrics['total'] = float(loss.detach().item())
@@ -270,4 +286,69 @@ def lpsrgan_val(val_loader, model, loss_fn, confusing_pair, *args):
             'ocr_char_acc_lr': float(sum(ocr_lr_char_accs) / len(ocr_lr_char_accs)),
         }
 
+    return sum(val_losses) / len(val_losses), report
+
+
+@register('ocr_train')
+def ocr_train(train_loader, model, optimizer, loss_fn, confusing_pair, *args):
+    config = args[0]
+    model_g, model_d = _get_model_parts(model)
+    optimizer_g, _ = _get_optimizer_parts(optimizer)
+
+    if model_d is not None:
+        raise RuntimeError('ocr_train expects a single trainable OCR model')
+
+    model_g.train()
+    train_losses = []
+    pbar = tqdm(train_loader, leave=False, desc='ocr-train')
+    for idx, batch in enumerate(pbar):
+        config['_loop_step'] = idx + 1
+        images = _get_ocr_input(batch, config)
+        loss = model_g.training_loss(images, batch['gt'])
+
+        optimizer_g.zero_grad()
+        loss.backward()
+        optimizer_g.step()
+
+        train_losses.append(float(loss.detach().item()))
+        pbar.set_postfix({'loss': round(train_losses[-1], 4)})
+
+    return sum(train_losses) / len(train_losses)
+
+
+@register('ocr_val')
+def ocr_val(val_loader, model, loss_fn, confusing_pair, *args):
+    config = args[0]
+    model_g, model_d = _get_model_parts(model)
+
+    if model_d is not None:
+        raise RuntimeError('ocr_val expects a single OCR model')
+
+    model_g.eval()
+    val_losses = []
+    reports = []
+    pbar = tqdm(val_loader, leave=False, desc='ocr-val')
+    with torch.no_grad():
+        for idx, batch in enumerate(pbar):
+            config['_loop_step'] = idx + 1
+            images = _get_ocr_input(batch, config)
+            loss = model_g.training_loss(images, batch['gt'])
+            outputs = model_g.evaluate(images, batch['gt'])
+
+            val_losses.append(float(loss.detach().item()))
+            reports.append(outputs['metrics'])
+            pbar.set_postfix(
+                {
+                    'loss': round(val_losses[-1], 4),
+                    'ocr': round(outputs['metrics']['ocr_score'], 4),
+                }
+            )
+
+    report = {}
+    if reports:
+        keys = reports[0].keys()
+        report = {
+            key: float(sum(item[key] for item in reports) / len(reports))
+            for key in keys
+        }
     return sum(val_losses) / len(val_losses), report

@@ -1,5 +1,5 @@
 import os
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -85,6 +85,9 @@ class BaseOCRAdapter(nn.Module):
         outputs = self.predict(images)
         return outputs['texts'], outputs['confidences']
 
+    def forward_logits(self, images):
+        raise NotImplementedError
+
     def predict(self, images):
         raise NotImplementedError
 
@@ -96,13 +99,60 @@ class BaseOCRAdapter(nn.Module):
         outputs['metrics'] = metrics
         return outputs
 
-    def teacher_loss(self, images, targets):
+    def teacher_loss(
+        self,
+        images,
+        targets=None,
+        reference_images=None,
+        mode='distill',
+        temperature=1.0,
+        confidence_weighted=True,
+    ):
         device = images.device if torch.is_tensor(images) else 'cpu'
         return torch.zeros((), device=device)
 
+    def training_loss(self, images, targets):
+        return self.teacher_loss(images, targets=targets)
 
-@register('gplpr_ocr')
-class GPLPROCRAdapter(BaseOCRAdapter):
+    def _normalize_confidence(self, confidence) -> torch.Tensor:
+        if torch.is_tensor(confidence):
+            return confidence.detach().cpu().float()
+        if isinstance(confidence, (list, tuple)):
+            values: List[float] = []
+            for item in confidence:
+                if torch.is_tensor(item):
+                    values.append(float(item.detach().cpu().float().mean().item()))
+                else:
+                    values.append(float(item))
+            return torch.tensor(values, dtype=torch.float32)
+        return torch.tensor([float(confidence)], dtype=torch.float32)
+
+    def _distill_from_reference(
+        self,
+        student_logits,
+        reference_logits,
+        temperature=1.0,
+        confidence_weighted=True,
+    ):
+        teacher_prob = F.softmax(reference_logits / temperature, dim=-1)
+        student_log_prob = F.log_softmax(student_logits / temperature, dim=-1)
+        token_kl = F.kl_div(
+            student_log_prob, teacher_prob, reduction='none'
+        ).sum(dim=-1).mean(dim=-1)
+
+        if confidence_weighted:
+            weights = teacher_prob.max(dim=-1).values.mean(dim=-1).detach()
+            token_kl = token_kl * weights
+
+        return token_kl.mean() * (temperature ** 2)
+
+    def _entropy_regularization(self, logits):
+        probs = F.softmax(logits, dim=-1)
+        entropy = -(probs * torch.log(probs.clamp_min(1e-8))).sum(dim=-1)
+        return entropy.mean()
+
+
+class _BaseGPLPROCRAdapter(BaseOCRAdapter):
     def __init__(
         self,
         load=None,
@@ -117,6 +167,8 @@ class GPLPROCRAdapter(BaseOCRAdapter):
         isl2Norm=True,
     ):
         super().__init__()
+        self.alphabet = alphabet
+        self.K = K
         self.model = make_GPLPR(
             alphabet=alphabet,
             nc=nc,
@@ -142,21 +194,119 @@ class GPLPROCRAdapter(BaseOCRAdapter):
                     filtered_state[key] = value
             self.model.load_state_dict(filtered_state, strict=False)
 
-        self.freeze()
-
-    def predict(self, images):
+    def _prepare_images(self, images):
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+        if images.size(1) == 1:
+            images = images.repeat(1, 3, 1, 1)
         if images.size(-2) != self.img_size[0] or images.size(-1) != self.img_size[1]:
             images = F.interpolate(
                 images, size=self.img_size, mode='bilinear', align_corners=False
             )
+        return images.clamp(0.0, 1.0)
+
+    def forward_logits(self, images):
+        images = self._prepare_images(images)
+        _, logits, _ = self.model(images)
+        return logits
+
+    def _encode_targets(self, targets, device):
+        target_tensor = self.model.converter.encode_list(targets, K=self.K).to(device)
+        return target_tensor
+
+    def _cross_entropy_loss(self, logits, targets):
+        target_tensor = self._encode_targets(targets, logits.device)
+        bsz, steps, vocab = logits.shape
+        per_token = F.cross_entropy(
+            logits.reshape(bsz * steps, vocab),
+            target_tensor.reshape(bsz * steps),
+            reduction='none',
+        ).view(bsz, steps)
+        valid = (target_tensor > 0).float()
+        denom = valid.sum().clamp_min(1.0)
+        return (per_token * valid).sum() / denom
+
+    def predict(self, images):
+        images = self._prepare_images(images)
         texts, confidences = self.model.OCR_pred(images)
-        if torch.is_tensor(confidences):
-            confidences = confidences.detach().cpu()
         return {
             'texts': texts,
-            'confidences': confidences,
-            'logits': None,
+            'confidences': self._normalize_confidence(confidences),
+            'logits': self.forward_logits(images),
         }
+
+
+@register('gplpr_ocr')
+class GPLPROCRAdapter(_BaseGPLPROCRAdapter):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.freeze()
+
+    def teacher_loss(
+        self,
+        images,
+        targets=None,
+        reference_images=None,
+        mode='distill',
+        temperature=1.0,
+        confidence_weighted=True,
+    ):
+        student_logits = self.forward_logits(images)
+        if reference_images is not None and mode == 'distill':
+            with torch.no_grad():
+                reference_logits = self.forward_logits(reference_images)
+            return self._distill_from_reference(
+                student_logits,
+                reference_logits,
+                temperature=temperature,
+                confidence_weighted=confidence_weighted,
+            )
+
+        if targets:
+            return self._cross_entropy_loss(student_logits, targets)
+
+        return self._entropy_regularization(student_logits)
+
+
+@register('gplpr_trainable_ocr')
+class GPLPRTrainableOCRAdapter(_BaseGPLPROCRAdapter):
+    def predict(self, images):
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            outputs = super().predict(images)
+        if was_training:
+            self.train()
+        return outputs
+
+    def teacher_loss(
+        self,
+        images,
+        targets=None,
+        reference_images=None,
+        mode='ce',
+        temperature=1.0,
+        confidence_weighted=True,
+    ):
+        logits = self.forward_logits(images)
+
+        if mode == 'distill' and reference_images is not None:
+            with torch.no_grad():
+                reference_logits = self.forward_logits(reference_images)
+            return self._distill_from_reference(
+                logits,
+                reference_logits,
+                temperature=temperature,
+                confidence_weighted=confidence_weighted,
+            )
+
+        if not targets:
+            raise ValueError('Trainable OCR mode requires targets for supervision')
+
+        return self._cross_entropy_loss(logits, targets)
+
+    def training_loss(self, images, targets):
+        return self.teacher_loss(images, targets=targets, mode='ce')
 
 
 @register('parseq_ocr')
@@ -191,6 +341,7 @@ class PARSeqOCRAdapter(BaseOCRAdapter):
                 [
                     '/home/re6141029/.cache/torch/hub/baudm_parseq_main',
                     os.path.expanduser('~/.cache/torch/hub/baudm_parseq_main'),
+                    '/tmp/torch_cache/baudm_parseq_main',
                 ]
             )
 
@@ -221,7 +372,7 @@ class PARSeqOCRAdapter(BaseOCRAdapter):
             load_attempts.append((self.hub_repo, self.source))
             load_attempts.extend((path, 'local') for path in self._get_local_repo_candidates())
 
-        last_error = None
+        last_error: Optional[Exception] = None
         model = None
         for repo_or_dir, source in load_attempts:
             try:
@@ -263,22 +414,12 @@ class PARSeqOCRAdapter(BaseOCRAdapter):
         images = (images - 0.5) / 0.5
         return images
 
-    def _normalize_confidence(self, confidence) -> torch.Tensor:
-        if torch.is_tensor(confidence):
-            return confidence.detach().cpu().float()
-        if isinstance(confidence, (list, tuple)):
-            values: List[float] = []
-            for item in confidence:
-                if torch.is_tensor(item):
-                    values.append(float(item.detach().cpu().float().mean().item()))
-                else:
-                    values.append(float(item))
-            return torch.tensor(values, dtype=torch.float32)
-        return torch.tensor([float(confidence)], dtype=torch.float32)
+    def forward_logits(self, images):
+        images = self._prepare_images(images)
+        return self.model(images)
 
     def predict(self, images):
-        images = self._prepare_images(images)
-        logits = self.model(images)
+        logits = self.forward_logits(images)
         probs = logits.softmax(-1)
         texts, confidence = self.model.tokenizer.decode(probs)
         return {
@@ -286,3 +427,28 @@ class PARSeqOCRAdapter(BaseOCRAdapter):
             'confidences': self._normalize_confidence(confidence),
             'logits': logits,
         }
+
+    def teacher_loss(
+        self,
+        images,
+        targets=None,
+        reference_images=None,
+        mode='distill',
+        temperature=1.0,
+        confidence_weighted=True,
+    ):
+        student_logits = self.forward_logits(images)
+
+        if reference_images is not None and mode == 'distill':
+            with torch.no_grad():
+                reference_logits = self.forward_logits(reference_images)
+            return self._distill_from_reference(
+                student_logits,
+                reference_logits,
+                temperature=temperature,
+                confidence_weighted=confidence_weighted,
+            )
+
+        # Fallback for settings without paired reference images:
+        # keep the OCR distribution sharp so SR does not collapse into low-confidence text.
+        return self._entropy_regularization(student_logits)

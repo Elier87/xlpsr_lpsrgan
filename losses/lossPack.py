@@ -54,6 +54,21 @@ def padding(img, min_ratio, max_ratio, color=(0, 0, 0)):
     return img, border_w, border_h
 
 
+@register('noopLoss')
+class NoOpLoss(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    def forward(self, *args, **kwargs):
+        device = 'cpu'
+        for arg in args:
+            if torch.is_tensor(arg):
+                device = arg.device
+                break
+        zero = torch.zeros((), device=device)
+        return zero, {'total': 0.0}, None
+
+
 @register('lpsrganLoss')
 class LPSRGANLoss(nn.Module):
     def __init__(

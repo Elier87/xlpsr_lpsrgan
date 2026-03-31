@@ -278,3 +278,134 @@ class SR_multi_image(_BaseLPWrapper):
             'gt': batch_plates,
             'name': file_name if self.test else None,
         }
+
+
+def crop_bbox(img, bbox, margin_ratio=0.08):
+    x1, y1, x2, y2 = bbox
+    h, w = img.shape[:2]
+    bw = max(x2 - x1, 1)
+    bh = max(y2 - y1, 1)
+    mx = int(bw * margin_ratio)
+    my = int(bh * margin_ratio)
+
+    x1 = max(0, x1 - mx)
+    y1 = max(0, y1 - my)
+    x2 = min(w, x2 + mx)
+    y2 = min(h, y2 + my)
+    return img[y1:y2, x1:x2]
+
+
+def frame_quality_score(img):
+    if img.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    return float(lap_var)
+
+
+@register('challenge_sequence_wrapper')
+class ChallengeSequenceWrapper(_BaseLPWrapper):
+    def __init__(
+        self,
+        imgW,
+        imgH,
+        aug,
+        image_aspect_ratio,
+        background,
+        mode='single',
+        num_frames=1,
+        bbox_margin=0.08,
+        selection='quality',
+        dataset=None,
+    ):
+        super().__init__(imgW, imgH, aug, image_aspect_ratio, background, dataset=dataset)
+        self.mode = mode
+        self.num_frames = num_frames
+        self.bbox_margin = bbox_margin
+        self.selection = selection
+
+        assert self.dataset is not None, f'Not a valid dataset {self.dataset}'
+
+    def _select_candidates(self, item):
+        candidates = []
+        for det in item['detections']:
+            frame_name = det.get('frame')
+            bbox = det.get('license_plate_coordinates')
+            if frame_name is None or bbox is None:
+                continue
+
+            frame_path = item['sequence_dir'] / frame_name
+            if not frame_path.exists():
+                continue
+
+            image = open_image(frame_path)
+            crop = crop_bbox(image, bbox, margin_ratio=self.bbox_margin)
+            if crop.size == 0:
+                continue
+
+            candidates.append(
+                {
+                    'frame_path': frame_path,
+                    'frame_name': frame_name,
+                    'bbox': bbox,
+                    'crop': crop,
+                    'score': frame_quality_score(crop),
+                }
+            )
+
+        if not candidates:
+            for frame_path in item['frames']:
+                image = open_image(frame_path)
+                candidates.append(
+                    {
+                        'frame_path': frame_path,
+                        'frame_name': frame_path.name,
+                        'bbox': None,
+                        'crop': image,
+                        'score': frame_quality_score(image),
+                    }
+                )
+
+        if self.selection == 'quality':
+            candidates.sort(key=lambda x: x['score'], reverse=True)
+        else:
+            candidates.sort(key=lambda x: x['frame_name'])
+
+        return candidates
+
+    def collate_fn(self, datas):
+        batch_lrs = []
+        batch_gt = []
+        batch_names = []
+        batch_sequence_ids = []
+        batch_frame_names = []
+        batch_bboxes = []
+        batch_scores = []
+
+        for item in datas:
+            candidates = self._select_candidates(item)
+            take = 1 if self.mode == 'single' else max(1, self.num_frames)
+            selected = candidates[:take]
+
+            crops = [self._prepare_image(candidate['crop']) for candidate in selected]
+            if self.mode == 'single':
+                batch_lrs.append(crops[0])
+            else:
+                batch_lrs.append(torch.stack(crops))
+
+            batch_gt.append(item.get('gt'))
+            batch_names.append(item['sequence_id'])
+            batch_sequence_ids.append(item['sequence_id'])
+            batch_frame_names.append([candidate['frame_name'] for candidate in selected])
+            batch_bboxes.append([candidate['bbox'] for candidate in selected])
+            batch_scores.append([candidate['score'] for candidate in selected])
+
+        return {
+            'lr': torch.stack(batch_lrs),
+            'gt': batch_gt,
+            'name': batch_names,
+            'sequence_id': batch_sequence_ids,
+            'frame_names': batch_frame_names,
+            'bboxes': batch_bboxes,
+            'quality_scores': batch_scores,
+        }

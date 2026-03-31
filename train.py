@@ -121,7 +121,7 @@ def _prepare_ocr_model():
     model_ocr = models.make(ocr_spec)
     if model_ocr is None:
         return None
-    if hasattr(model_ocr, 'freeze'):
+    if ocr_spec.get('freeze', True) and hasattr(model_ocr, 'freeze'):
         model_ocr.freeze()
     return model_ocr.cuda()
 

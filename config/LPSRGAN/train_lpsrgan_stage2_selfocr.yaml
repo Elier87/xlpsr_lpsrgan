@@ -5,15 +5,19 @@ model:
     dropout_prob: 0.5
 
 model_ocr:
-  name: parseq_ocr
+  name: gplpr_trainable_ocr
   freeze: True
   args:
-    hub_repo: baudm/parseq
-    model_name: parseq
-    pretrained: True
+    alphabet: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    nc: 3
+    imgW: 96
+    imgH: 32
+    K: 7
+    isSeqModel: True
+    head: 2
+    inner: 256
+    isl2Norm: True
     load: null
-    img_size: [32, 128]
-    source: github
 
 optimizer_g:
   name: adam
@@ -30,12 +34,10 @@ optimizer_d:
 func_train: lpsrgan_train
 func_val: lpsrgan_val
 training_stage: gan
-tag_view: stage2_parseq
+tag_view: stage2_selfocr
 visualize_interval: 0
-ocr_supervision_weight: 0.02
-ocr_supervision_mode: distill
-ocr_supervision_temperature: 1.5
-ocr_confidence_weighted: True
+ocr_supervision_weight: 0.01
+ocr_supervision_mode: ce
 ocr_reference_key: hr
 
 train_dataset:

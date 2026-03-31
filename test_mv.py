@@ -46,9 +46,9 @@ def prepare_testing():
     if n_gpus > 1 and model_sr is not None:
         model_sr = nn.parallel.DataParallel(model_sr)
 
-    if config['model_ocr']['name'] in {'parseq_ocr', 'gplpr_ocr', 'ocr'}:
+    if config['model_ocr']['name'] in {'parseq_ocr', 'gplpr_ocr', 'gplpr_trainable_ocr', 'ocr'}:
         model_ocr = models.make(config['model_ocr']).cuda()
-        if hasattr(model_ocr, 'freeze'):
+        if config['model_ocr'].get('freeze', True) and hasattr(model_ocr, 'freeze'):
             model_ocr.freeze()
     else:
         ocr_cfg = config['model_ocr']
