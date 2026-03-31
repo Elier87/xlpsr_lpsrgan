@@ -62,7 +62,10 @@ class Timer():
             return '{:.1f}s'.format(time)
   
 def compute_num_params(model, text=False):
-    tot = int(sum([np.prod(p.shape) for p in model.parameters()]))
+    if isinstance(model, (tuple, list)):
+        tot = int(sum(compute_num_params(module) for module in model if module is not None))
+    else:
+        tot = int(sum([np.prod(p.shape) for p in model.parameters()]))
     if text:
         if tot >= 1e6:
             return '{:.1f}M'.format(tot / 1e6)
