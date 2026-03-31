@@ -1,5 +1,6 @@
 import argparse
 import copy
+import inspect
 import random
 import smtplib
 from email.mime.text import MIMEText
@@ -69,8 +70,11 @@ def _get_model_for_save(model):
 
 def _make_optimizer_pair(model):
     if _is_multi_model(model):
-        optimizer_g_spec = config.get('optimizer_g', config['optimizer'])
-        optimizer_d_spec = config.get('optimizer_d', config.get('optimizer'))
+        optimizer_default = config.get('optimizer')
+        optimizer_g_spec = config.get('optimizer_g', optimizer_default)
+        optimizer_d_spec = config.get('optimizer_d', optimizer_default)
+        if optimizer_g_spec is None or optimizer_d_spec is None:
+            raise KeyError('Tuple model training requires optimizer_g and optimizer_d')
         optimizer_g = utils.make_optimizer(model[0].parameters(), optimizer_g_spec)
         optimizer_d = utils.make_optimizer(model[1].parameters(), optimizer_d_spec)
         return optimizer_g, optimizer_d
@@ -98,7 +102,10 @@ def _make_scheduler(optimizer, state_dict=None):
         return None
 
     scheduler_target = optimizer[0] if isinstance(optimizer, (tuple, list)) else optimizer
-    scheduler = ReduceLROnPlateau(scheduler_target, **config['reduce_on_plateau'])
+    scheduler_args = dict(config['reduce_on_plateau'])
+    valid_keys = set(inspect.signature(ReduceLROnPlateau.__init__).parameters.keys())
+    scheduler_args = {k: v for k, v in scheduler_args.items() if k in valid_keys}
+    scheduler = ReduceLROnPlateau(scheduler_target, **scheduler_args)
     if state_dict is not None:
         scheduler.load_state_dict(state_dict)
     return scheduler
@@ -176,8 +183,11 @@ def _save_checkpoint(model, optimizer, epoch, lr_scheduler, early_stopper, save_
     }
 
     if isinstance(optimizer, (tuple, list)):
-        optimizer_g_spec = copy.deepcopy(config.get('optimizer_g', config['optimizer']))
-        optimizer_d_spec = copy.deepcopy(config.get('optimizer_d', config['optimizer']))
+        optimizer_default = config.get('optimizer')
+        optimizer_g_spec = copy.deepcopy(config.get('optimizer_g', optimizer_default))
+        optimizer_d_spec = copy.deepcopy(config.get('optimizer_d', optimizer_default))
+        if optimizer_g_spec is None or optimizer_d_spec is None:
+            raise KeyError('Tuple model checkpointing requires optimizer_g and optimizer_d')
         optimizer_g_spec['sd'] = optimizer[0].state_dict()
         optimizer_d_spec['sd'] = optimizer[1].state_dict()
         sv_file['optimizer_g'] = optimizer_g_spec

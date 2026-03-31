@@ -4,22 +4,11 @@ model:
     num_blocks: 3
     dropout_prob: 0.5
 
-model_ocr:
-  name: parseq_ocr
-  freeze: True
-  args:
-    hub_repo: baudm/parseq
-    model_name: parseq
-    pretrained: True
-    load: null
-    img_size: [32, 128]
-    source: github
-
 optimizer_g:
   name: adam
   args:
-    lr: 1.e-4
-    betas: [0.5, 0.999]
+    lr: 2.e-4
+    betas: [0.9, 0.999]
 
 optimizer_d:
   name: adam
@@ -27,16 +16,11 @@ optimizer_d:
     lr: 1.e-4
     betas: [0.5, 0.999]
 
-func_train: lpsrgan_train
+func_train: lpsrgan_pretrain
 func_val: lpsrgan_val
-training_stage: gan
-tag_view: stage2_parseq
+training_stage: pretrain
+tag_view: paired_pretrain_smoke
 visualize_interval: 0
-ocr_supervision_weight: 0.02
-ocr_supervision_mode: distill
-ocr_supervision_temperature: 1.5
-ocr_confidence_weighted: True
-ocr_reference_key: hr
 
 train_dataset:
   dataset:
@@ -46,6 +30,7 @@ train_dataset:
         - ./ufpr-sr/UFPR-SR-plates/1920_1080
         - ./ufpr-sr/UFPR-SR-plates/1280_0960
       phase: training
+      max_folders: 32
   wrapper:
     name: lpsrgan
     args:
@@ -55,7 +40,7 @@ train_dataset:
       image_aspect_ratio: 3
       background: (127, 127, 127)
       rectify: False
-  batch: 16
+  batch: 8
 
 val_dataset:
   dataset:
@@ -65,6 +50,7 @@ val_dataset:
         - ./ufpr-sr/UFPR-SR-plates/1920_1080
         - ./ufpr-sr/UFPR-SR-plates/1280_0960
       phase: validation
+      max_folders: 32
   wrapper:
     name: lpsrgan
     args:
@@ -74,31 +60,31 @@ val_dataset:
       image_aspect_ratio: 3
       background: (127, 127, 127)
       rectify: False
-  batch: 16
+  batch: 8
 
 loss:
   name: lpsrganLoss
   args:
     pixel_weight: 1.0
     perceptual_weight: 0.1
-    adversarial_weight: 0.005
+    adversarial_weight: 0.0
     use_perceptual: True
     use_ocr: False
     ocr_weight: 0.0
     load: null
 
 early_stopper:
-  patience: 50
+  patience: 5
   min_delta: 0
   counter: 0
 
 reduce_on_plateau:
   mode: min
   factor: 0.5
-  patience: 10
+  patience: 2
   min_lr: 1.e-7
   verbose: True
 
-epoch_max: 300
-epoch_save: 50
+epoch_max: 1
+epoch_save: 1
 resume: null

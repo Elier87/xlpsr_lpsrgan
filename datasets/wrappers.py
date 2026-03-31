@@ -107,9 +107,10 @@ def get_pts(file_path):
 
 
 class _BaseLPWrapper(Dataset):
-    def __init__(self, imgW, imgH, aug, image_aspect_ratio, background, dataset=None):
+    def __init__(self, imgW, imgH, aug, image_aspect_ratio, background, scale=2, dataset=None):
         self.imgW = imgW
         self.imgH = imgH
+        self.scale = scale
         self.aug = aug
         self.ar = image_aspect_ratio
         self.background = eval(background) if isinstance(background, str) else background
@@ -140,11 +141,13 @@ class _BaseLPWrapper(Dataset):
             is_check_shapes=False,
         )
 
-    def _prepare_image(self, img):
+    def _prepare_image(self, img, size=None):
+        if size is None:
+            size = (self.imgH, self.imgW)
         img, _, _, _ = pad_with_mask(
             img, self.ar - 0.15, self.ar + 0.15, color=self.background
         )
-        return resize_fn(img, (self.imgH, self.imgW))
+        return resize_fn(img, size)
 
 
 @register('lpsrgan')
@@ -156,10 +159,13 @@ class SRPairedImageWrapper(_BaseLPWrapper):
         aug,
         image_aspect_ratio,
         background,
+        scale=2,
         rectify=False,
         dataset=None,
     ):
-        super().__init__(imgW, imgH, aug, image_aspect_ratio, background, dataset=dataset)
+        super().__init__(
+            imgW, imgH, aug, image_aspect_ratio, background, scale=scale, dataset=dataset
+        )
         self.rectify = rectify
         self.transform = self._make_transform()
 
@@ -205,8 +211,12 @@ class SRPairedImageWrapper(_BaseLPWrapper):
             if self.aug:
                 img_lr, img_hr = self._augment_pair(img_lr, img_hr)
 
-            batch_lrs.append(self._prepare_image(img_lr))
-            batch_hrs.append(self._prepare_image(img_hr))
+            batch_lrs.append(self._prepare_image(img_lr, size=(self.imgH, self.imgW)))
+            batch_hrs.append(
+                self._prepare_image(
+                    img_hr, size=(self.imgH * self.scale, self.imgW * self.scale)
+                )
+            )
             batch_plates.append(item['gt'])
             batch_names.append(item.get('name', lr_path.stem))
 

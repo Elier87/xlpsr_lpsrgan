@@ -24,9 +24,11 @@ visualize_interval: 0
 
 train_dataset:
   dataset:
-    name: paired_image
+    name: ufpr_paired
     args:
-      path_split: ./split_all_example.txt
+      roots:
+        - ./ufpr-sr/UFPR-SR-plates/1920_1080
+        - ./ufpr-sr/UFPR-SR-plates/1280_0960
       phase: training
   wrapper:
     name: lpsrgan
@@ -41,9 +43,11 @@ train_dataset:
 
 val_dataset:
   dataset:
-    name: paired_image
+    name: ufpr_paired
     args:
-      path_split: ./split_all_example.txt
+      roots:
+        - ./ufpr-sr/UFPR-SR-plates/1920_1080
+        - ./ufpr-sr/UFPR-SR-plates/1280_0960
       phase: validation
   wrapper:
     name: lpsrgan
