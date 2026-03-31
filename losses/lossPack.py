@@ -1,4 +1,5 @@
 import re
+import os
 from pathlib import Path
 
 import cv2
@@ -118,13 +119,17 @@ class LPSRGANLoss(nn.Module):
 class VGG19FeatureExtractor(nn.Module):
     def __init__(self):
         super().__init__()
+        torch.hub.set_dir(os.environ.get('TORCH_HOME', '/tmp/torch_cache'))
         try:
             if VGG19_Weights is not None:
                 self.vgg = vgg19(weights=VGG19_Weights.DEFAULT).features.eval()
             else:
                 raise RuntimeError('VGG19_Weights unavailable')
         except Exception:
-            self.vgg = vgg19(pretrained=True).features.eval()
+            try:
+                self.vgg = vgg19(pretrained=True).features.eval()
+            except Exception:
+                self.vgg = vgg19(weights=None).features.eval()
 
         self.block_indices = [3, 8, 17, 26, 35]
         blocks = []

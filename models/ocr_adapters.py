@@ -1,3 +1,4 @@
+import os
 from typing import List
 
 import torch
@@ -134,7 +135,12 @@ class GPLPROCRAdapter(BaseOCRAdapter):
             state_dict = ckpt
             if isinstance(ckpt, dict) and 'model' in ckpt:
                 state_dict = ckpt['model'].get('sd', ckpt['model'])
-            self.model.load_state_dict(state_dict, strict=False)
+            model_state = self.model.state_dict()
+            filtered_state = {}
+            for key, value in state_dict.items():
+                if key in model_state and model_state[key].shape == value.shape:
+                    filtered_state[key] = value
+            self.model.load_state_dict(filtered_state, strict=False)
 
         self.freeze()
 
@@ -175,14 +181,59 @@ class PARSeqOCRAdapter(BaseOCRAdapter):
         self.img_size = tuple(default_size or img_size or (32, 128))
         self.freeze()
 
-    def _build_model(self):
-        hub_kwargs = {'source': 'local'} if self.source == 'local' else {}
-        model = torch.hub.load(
-            self.hub_repo,
+    def _get_local_repo_candidates(self):
+        candidates = []
+        if os.path.isdir(self.hub_repo):
+            candidates.append(self.hub_repo)
+
+        if self.hub_repo == 'baudm/parseq':
+            candidates.extend(
+                [
+                    '/home/re6141029/.cache/torch/hub/baudm_parseq_main',
+                    os.path.expanduser('~/.cache/torch/hub/baudm_parseq_main'),
+                ]
+            )
+
+        unique = []
+        for path in candidates:
+            if path not in unique and os.path.isdir(path):
+                unique.append(path)
+        return unique
+
+    def _load_hub_model(self, repo_or_dir, source):
+        kwargs = {}
+        if source == 'local':
+            kwargs['source'] = 'local'
+        return torch.hub.load(
+            repo_or_dir,
             self.model_name,
             pretrained=self.pretrained if self.load is None else False,
-            **hub_kwargs,
+            **kwargs,
         )
+
+    def _build_model(self):
+        torch.hub.set_dir(os.environ.get('TORCH_HOME', '/tmp/torch_cache'))
+
+        load_attempts = []
+        if self.source == 'local':
+            load_attempts.extend((path, 'local') for path in self._get_local_repo_candidates())
+        else:
+            load_attempts.append((self.hub_repo, self.source))
+            load_attempts.extend((path, 'local') for path in self._get_local_repo_candidates())
+
+        last_error = None
+        model = None
+        for repo_or_dir, source in load_attempts:
+            try:
+                model = self._load_hub_model(repo_or_dir, source)
+                break
+            except Exception as exc:
+                last_error = exc
+
+        if model is None:
+            raise RuntimeError(
+                f'Unable to load PARSeq from {self.hub_repo!r} or local cache candidates.'
+            ) from last_error
 
         if self.load is not None:
             ckpt = torch.load(self.load, map_location='cpu')

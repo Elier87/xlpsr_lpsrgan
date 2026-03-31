@@ -5,8 +5,6 @@ import torch.nn.functional as F
 from argparse import Namespace
 from models import register
 
-from basicsr.archs.rrdbnet_arch import RRDBNet
-
 def ConvBlock(in_channels, out_channels, kernel_size=(3, 3), stride=(1, 1), padding='same',
                is_bn=True, is_relu=True, n=2):
     """ Custom function for conv2d:

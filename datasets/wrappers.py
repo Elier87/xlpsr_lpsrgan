@@ -124,7 +124,7 @@ class _BaseLPWrapper(Dataset):
     def _make_transform(self):
         transform = A.OneOf(
             [
-                A.SafeRotate(limit=2, border_mode=cv2.BORDER_REPLICATE, value=127, p=1.0),
+                A.SafeRotate(limit=2, border_mode=cv2.BORDER_REPLICATE, p=1.0),
                 A.RandomBrightnessContrast(
                     brightness_limit=0.1, contrast_limit=0.2, p=1.0
                 ),
@@ -136,7 +136,7 @@ class _BaseLPWrapper(Dataset):
         )
         return A.Compose(
             [transform],
-            additional_targets={'image2': 'image'},
+            additional_targets={'image2': 'image', 'mask2': 'mask'},
             is_check_shapes=False,
         )
 
