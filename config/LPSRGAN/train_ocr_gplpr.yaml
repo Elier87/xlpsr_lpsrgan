@@ -22,6 +22,8 @@ func_train: ocr_train
 func_val: ocr_val
 training_stage: ocr
 ocr_input_key: hr
+ocr_score_conf_threshold: 0.5
+val_visualize_max_samples: 16
 
 train_dataset:
   dataset:

@@ -210,6 +210,7 @@ def _save_checkpoint(model, optimizer, epoch, lr_scheduler, early_stopper, save_
 def main(config_, save_path):
     global config, log, writer
     config = config_
+    config['save_path'] = str(save_path)
 
     log, writer = utils.make_log_writer(save_path)
     train_loader, val_loader = make_dataloaders()
@@ -270,6 +271,7 @@ def main(config_, save_path):
             model, optimizer, epoch, lr_scheduler, early_stopper, save_path, best_model
         )
 
+        print(', '.join(log_info))
         log(', '.join(log_info))
         writer.flush()
 

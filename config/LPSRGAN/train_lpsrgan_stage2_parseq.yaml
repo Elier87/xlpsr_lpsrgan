@@ -31,12 +31,14 @@ func_train: lpsrgan_train
 func_val: lpsrgan_val
 training_stage: gan
 tag_view: stage2_parseq
-visualize_interval: 0
+visualize_interval: 3
 ocr_supervision_weight: 0.02
 ocr_supervision_mode: distill
 ocr_supervision_temperature: 1.5
 ocr_confidence_weighted: True
 ocr_reference_key: hr
+ocr_score_conf_threshold: 0.5
+val_visualize_max_samples: 16
 
 train_dataset:
   dataset:
@@ -101,4 +103,4 @@ reduce_on_plateau:
 
 epoch_max: 300
 epoch_save: 50
-resume: null
+resume: ./save/train_lpsrgan_pretrain/best_model_Epoch_77.pth

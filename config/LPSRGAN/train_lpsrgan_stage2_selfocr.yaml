@@ -39,6 +39,8 @@ visualize_interval: 0
 ocr_supervision_weight: 0.01
 ocr_supervision_mode: ce
 ocr_reference_key: hr
+ocr_score_conf_threshold: 0.5
+val_visualize_max_samples: 16
 
 train_dataset:
   dataset:
