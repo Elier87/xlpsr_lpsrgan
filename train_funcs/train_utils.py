@@ -82,7 +82,7 @@ def _get_optimizer_parts(optimizer):
     return optimizer_g, optimizer_d
 
 
-def _maybe_visualize(batch, sr_batch, config, preds=None):
+def _maybe_visualize(batch, sr_batch, config, preds=None, ocr_model=None):
     visualize_interval = config.get('visualize_interval', 0)
     visualize_idx = config.get('visualize_idx', 0)
     current_step = config.get('_loop_step', 0)
@@ -99,8 +99,32 @@ def _maybe_visualize(batch, sr_batch, config, preds=None):
     image2 = transforms.ToPILImage()(sr_batch[visualize_idx].detach().cpu())
     image3 = transforms.ToPILImage()(batch['hr'][visualize_idx].detach().cpu())
     gt_text = batch['gt'][visualize_idx]
-    pred_text = preds[visualize_idx] if preds else 'SR'
-    save_visualized_images(image1, image2, image3, output_path, pred_text, gt_text)
+    lr_text = 'LR'
+    sr_text = preds[visualize_idx] if preds else 'SR'
+
+    if ocr_model is not None:
+        with torch.no_grad():
+            lr_up = F.interpolate(
+                batch['lr'][visualize_idx:visualize_idx + 1].cuda(),
+                size=(sr_batch.size(2), sr_batch.size(3)),
+                mode='bilinear',
+                align_corners=False,
+            )
+            sr_single = sr_batch[visualize_idx:visualize_idx + 1].cuda()
+            lr_eval = ocr_model.predict(lr_up)
+            sr_eval = ocr_model.predict(sr_single)
+            lr_text = lr_eval['texts'][0]
+            sr_text = sr_eval['texts'][0]
+
+    save_visualized_images(
+        image1,
+        image2,
+        image3,
+        output_path,
+        lr_text=lr_text,
+        sr_text=sr_text,
+        gt_text=gt_text,
+    )
 
 
 def _run_generator_loss(loss_fn, sr_batch, batch, loss_adv=None):
@@ -266,7 +290,7 @@ def lpsrgan_pretrain(train_loader, model, optimizer, loss_fn, confusing_pair, *a
         optimizer_g.step()
 
         train_losses.append(metrics['total'])
-        _maybe_visualize(batch, sr_batch, config, preds=preds)
+        _maybe_visualize(batch, sr_batch, config, preds=preds, ocr_model=ocr_model)
         pbar.set_postfix(_format_postfix(metrics))
 
     return sum(train_losses) / len(train_losses)
@@ -316,7 +340,7 @@ def lpsrgan_train(train_loader, model, optimizer, loss_fn, confusing_pair, *args
 
         train_losses.append(metrics['total'])
         d_losses.append(loss_d.detach().item())
-        _maybe_visualize(batch, sr_batch, config, preds=preds)
+        _maybe_visualize(batch, sr_batch, config, preds=preds, ocr_model=ocr_model)
         pbar.set_postfix(_format_postfix(metrics, extra={'d': round(d_losses[-1], 4)}))
 
     return sum(train_losses) / len(train_losses)
@@ -417,7 +441,7 @@ def lpsrgan_val(val_loader, model, loss_fn, confusing_pair, *args):
                     batch, sr_batch, batch_rows, config, saved_visuals
                 )
 
-            _maybe_visualize(batch, sr_batch, config, preds=preds)
+            _maybe_visualize(batch, sr_batch, config, preds=preds, ocr_model=ocr_model)
             postfix_extra = None
             if ocr_model is not None and ocr_sr_scores:
                 postfix_extra = {

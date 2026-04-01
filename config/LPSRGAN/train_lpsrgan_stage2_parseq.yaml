@@ -32,7 +32,7 @@ func_val: lpsrgan_val
 training_stage: gan
 tag_view: stage2_parseq
 visualize_interval: 3
-ocr_supervision_weight: 0.02
+ocr_supervision_weight: 0.05
 ocr_supervision_mode: distill
 ocr_supervision_temperature: 1.5
 ocr_confidence_weighted: True
@@ -83,7 +83,7 @@ loss:
   args:
     pixel_weight: 1.0
     perceptual_weight: 0.1
-    adversarial_weight: 0.005
+    adversarial_weight: 0.003
     use_perceptual: True
     use_ocr: False
     ocr_weight: 0.0
@@ -103,4 +103,4 @@ reduce_on_plateau:
 
 epoch_max: 300
 epoch_save: 50
-resume: ./save/train_lpsrgan_pretrain/best_model_Epoch_77.pth
+resume: ./save/train_lpsrgan/epoch-last.pth
