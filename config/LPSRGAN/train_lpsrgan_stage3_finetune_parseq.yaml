@@ -1,30 +1,50 @@
 model:
-  name: gplpr_trainable_ocr
+  name: lpsrgan
   args:
-    load: null
-    alphabet: 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ
-    nc: 3
-    imgW: 96
-    imgH: 32
-    K: 8
-    isSeqModel: True
-    head: 2
-    inner: 256
-    isl2Norm: True
+    num_blocks: 3
+    dropout_prob: 0.5
 
-optimizer:
+model_ocr:
+  name: parseq_ocr
+  freeze: True
+  args:
+    hub_repo: baudm/parseq
+    model_name: parseq
+    pretrained: True
+    load: null
+    img_size: [32, 128]
+    source: github
+
+optimizer_g:
   name: adam
   args:
     lr: 5.e-5
-    betas: [0.9, 0.999]
+    betas: [0.5, 0.999]
 
-func_train: ocr_train
-func_val: ocr_val
-training_stage: stage3_ocr
-tag_view: stage3_ocr
-ocr_input_key: lr
+optimizer_d:
+  name: adam
+  args:
+    lr: 1.e-4
+    betas: [0.5, 0.999]
+
+func_train: challenge_finetune_train
+func_val: challenge_finetune_val
+training_stage: stage3_finetune
+tag_view: stage3_finetune_parseq
+visualize_interval: 0
+sr_size: [32, 96]
+decision_strategy: character_vote
+
+challenge_teacher_weight: 1.0
+challenge_teacher_mode: distill
+challenge_teacher_temperature: 1.5
+challenge_teacher_confidence_weighted: True
+challenge_sharpness_weight: 0.02
+challenge_sequence_consistency_weight: 0.05
+challenge_image_anchor_weight: 0.0
+
 ocr_score_conf_threshold: 0.65
-val_visualize_max_samples: 0
+val_visualize_max_samples: 5
 
 train_dataset:
   dataset:
@@ -36,18 +56,18 @@ train_dataset:
       train_ratio: 0.8
       val_ratio: 0.2
   wrapper:
-    name: challenge_finetune_wrapper
+    name: challenge_sequence_wrapper
     args:
       imgW: 48
       imgH: 16
       aug: False
       image_aspect_ratio: 3
       background: (127, 127, 127)
+      mode: sequence
+      num_frames: 10
       bbox_margin: 0.08
       selection: quality
-      topk_pool: 5
-      sample_strategy: random_topk
-  batch: 8
+  batch: 4
 
 val_dataset:
   dataset:
@@ -59,25 +79,25 @@ val_dataset:
       train_ratio: 0.8
       val_ratio: 0.2
   wrapper:
-    name: challenge_finetune_wrapper
+    name: challenge_sequence_wrapper
     args:
       imgW: 48
       imgH: 16
       aug: False
       image_aspect_ratio: 3
       background: (127, 127, 127)
+      mode: sequence
+      num_frames: 10
       bbox_margin: 0.08
       selection: quality
-      topk_pool: 1
-      sample_strategy: best
-  batch: 8
+  batch: 4
 
 loss:
   name: noopLoss
   args: {}
 
 early_stopper:
-  patience: 30
+  patience: 10
   min_delta: 0
   counter: 0
 
@@ -88,6 +108,6 @@ reduce_on_plateau:
   min_lr: 1.e-7
   verbose: True
 
-epoch_max: 80
+epoch_max: 120
 epoch_save: 20
-resume: null
+resume: ./save/train_lpsrgan_stage2_parseq/epoch-last.pth

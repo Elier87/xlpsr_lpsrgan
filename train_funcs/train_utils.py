@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from models.ocr_adapters import calc_text_score_and_acc
 from train_funcs import register
+from utils_challenge import aggregate_sequence_predictions
 
 
 def save_visualized_images(
@@ -352,6 +353,177 @@ def _collect_ocr_report(lr_eval, sr_eval, batch, config):
     return report, rows
 
 
+def _flatten_challenge_lr(lr_batch):
+    if lr_batch.dim() == 5:
+        batch_size, num_frames, channels, height, width = lr_batch.shape
+        return lr_batch.view(batch_size * num_frames, channels, height, width), batch_size, num_frames
+    if lr_batch.dim() == 4:
+        batch_size, channels, height, width = lr_batch.shape
+        return lr_batch.view(batch_size, channels, height, width), batch_size, 1
+    raise ValueError(f'Unsupported challenge lr shape: {tuple(lr_batch.shape)}')
+
+
+def _repeat_targets(targets, repeat):
+    return [target for target in targets for _ in range(repeat)]
+
+
+def _chunk_list(values, batch_size, num_frames):
+    return [values[idx * num_frames:(idx + 1) * num_frames] for idx in range(batch_size)]
+
+
+def _sequence_consistency_loss(logits, batch_size, num_frames, temperature=1.0):
+    if num_frames <= 1:
+        return torch.zeros((), device=logits.device)
+
+    steps = logits.size(1)
+    vocab = logits.size(2)
+    log_probs = F.log_softmax(logits / temperature, dim=-1).view(batch_size, num_frames, steps, vocab)
+    probs = log_probs.exp()
+    mean_probs = probs.mean(dim=1, keepdim=True).detach()
+    kl = F.kl_div(log_probs, mean_probs.expand_as(probs), reduction='none').sum(dim=-1)
+    return kl.mean() * (temperature ** 2)
+
+
+def _compute_stage3_parseq_loss(sr_batch, lr_batch, batch, config, ocr_model, batch_size, num_frames):
+    if ocr_model is None:
+        raise RuntimeError('Stage 3 parseq finetune requires a frozen OCR teacher')
+
+    lr_up = _upsample_lr_batch(lr_batch, sr_batch, config)
+
+    teacher_weight = float(config.get('challenge_teacher_weight', 1.0))
+    sharpness_weight = float(config.get('challenge_sharpness_weight', 0.02))
+    consistency_weight = float(config.get('challenge_sequence_consistency_weight', 0.0))
+    image_anchor_weight = float(config.get('challenge_image_anchor_weight', 0.0))
+    temperature = float(config.get('challenge_teacher_temperature', 1.0))
+    confidence_weighted = bool(config.get('challenge_teacher_confidence_weighted', True))
+
+    teacher_loss = ocr_model.teacher_loss(
+        sr_batch,
+        targets=batch.get('gt'),
+        reference_images=lr_up,
+        mode=config.get('challenge_teacher_mode', 'distill'),
+        temperature=temperature,
+        confidence_weighted=confidence_weighted,
+    )
+    sharpness_loss = ocr_model.teacher_loss(
+        sr_batch,
+        targets=batch.get('gt'),
+        reference_images=None,
+        mode='entropy',
+        temperature=temperature,
+        confidence_weighted=confidence_weighted,
+    )
+
+    total = teacher_weight * teacher_loss + sharpness_weight * sharpness_loss
+    metrics = {
+        'teacher': float(teacher_loss.detach().item()),
+        'sharpness': float(sharpness_loss.detach().item()),
+        'consistency': 0.0,
+        'image_anchor': 0.0,
+        'total': float(total.detach().item()),
+    }
+
+    if consistency_weight > 0.0 and num_frames > 1:
+        student_logits = ocr_model.forward_logits(sr_batch)
+        consistency_loss = _sequence_consistency_loss(
+            student_logits, batch_size=batch_size, num_frames=num_frames, temperature=temperature
+        )
+        total = total + consistency_weight * consistency_loss
+        metrics['consistency'] = float(consistency_loss.detach().item())
+
+    if image_anchor_weight > 0.0:
+        image_anchor = F.l1_loss(sr_batch, lr_up)
+        total = total + image_anchor_weight * image_anchor
+        metrics['image_anchor'] = float(image_anchor.detach().item())
+
+    metrics['total'] = float(total.detach().item())
+    return total, metrics, lr_up
+
+
+def _collect_stage3_sequence_report(lr_eval, sr_eval, batch, batch_size, num_frames, config):
+    flat_targets = _repeat_targets(batch['gt'], num_frames)
+    lr_conf_flat = _normalize_confidences(lr_eval['confidences'], len(flat_targets))
+    sr_conf_flat = _normalize_confidences(sr_eval['confidences'], len(flat_targets))
+    score_conf_threshold = config.get('ocr_score_conf_threshold')
+
+    frame_score_lr = []
+    frame_score_sr = []
+    for idx, gt_text in enumerate(flat_targets):
+        pred_lr = _apply_confidence_filter(
+            lr_eval['texts'][idx], lr_conf_flat[idx], score_conf_threshold
+        )
+        pred_sr = _apply_confidence_filter(
+            sr_eval['texts'][idx], sr_conf_flat[idx], score_conf_threshold
+        )
+        score_lr, _, _ = calc_text_score_and_acc(pred_lr, gt_text)
+        score_sr, _, _ = calc_text_score_and_acc(pred_sr, gt_text)
+        frame_score_lr.append(score_lr)
+        frame_score_sr.append(score_sr)
+
+    lr_texts_by_seq = _chunk_list(lr_eval['texts'], batch_size, num_frames)
+    sr_texts_by_seq = _chunk_list(sr_eval['texts'], batch_size, num_frames)
+    lr_conf_by_seq = _chunk_list(lr_conf_flat, batch_size, num_frames)
+    sr_conf_by_seq = _chunk_list(sr_conf_flat, batch_size, num_frames)
+
+    decision_strategy = config.get('decision_strategy', 'most_frequent')
+    seq_rows = []
+    sequence_score_lr = []
+    sequence_score_sr = []
+    sequence_acc_lr = []
+    sequence_acc_sr = []
+    sequence_char_acc_lr = []
+    sequence_char_acc_sr = []
+
+    for sample_idx, gt_text in enumerate(batch['gt']):
+        pred_lr_final = aggregate_sequence_predictions(
+            lr_texts_by_seq[sample_idx], lr_conf_by_seq[sample_idx], strategy=decision_strategy
+        )
+        pred_sr_final = aggregate_sequence_predictions(
+            sr_texts_by_seq[sample_idx], sr_conf_by_seq[sample_idx], strategy=decision_strategy
+        )
+
+        score_lr, exact_lr, char_acc_lr = calc_text_score_and_acc(pred_lr_final, gt_text)
+        score_sr, exact_sr, char_acc_sr = calc_text_score_and_acc(pred_sr_final, gt_text)
+        sequence_score_lr.append(score_lr)
+        sequence_score_sr.append(score_sr)
+        sequence_acc_lr.append(exact_lr)
+        sequence_acc_sr.append(exact_sr)
+        sequence_char_acc_lr.append(char_acc_lr)
+        sequence_char_acc_sr.append(char_acc_sr)
+
+        seq_rows.append(
+            {
+                'name': batch['name'][sample_idx],
+                'gt': gt_text,
+                'pred_lr': pred_lr_final,
+                'pred_sr': pred_sr_final,
+                'conf_lr': max(lr_conf_by_seq[sample_idx]) if lr_conf_by_seq[sample_idx] else 0.0,
+                'conf_sr': max(sr_conf_by_seq[sample_idx]) if sr_conf_by_seq[sample_idx] else 0.0,
+                'score_lr': score_lr,
+                'score_sr': score_sr,
+            }
+        )
+
+    report = {
+        'ocr_score_sr': float(sr_eval['metrics']['ocr_score']),
+        'ocr_acc_sr': float(sr_eval['metrics']['ocr_acc']),
+        'ocr_char_acc_sr': float(sr_eval['metrics']['ocr_char_acc']),
+        'ocr_conf_sr': float(sr_eval['metrics']['ocr_conf']),
+        'ocr_score_lr': float(lr_eval['metrics']['ocr_score']),
+        'ocr_acc_lr': float(lr_eval['metrics']['ocr_acc']),
+        'ocr_char_acc_lr': float(lr_eval['metrics']['ocr_char_acc']),
+        'mean_score_lr': float(sum(frame_score_lr) / max(len(frame_score_lr), 1)),
+        'mean_score_sr': float(sum(frame_score_sr) / max(len(frame_score_sr), 1)),
+        'sequence_score_lr': float(sum(sequence_score_lr) / max(len(sequence_score_lr), 1)),
+        'sequence_score_sr': float(sum(sequence_score_sr) / max(len(sequence_score_sr), 1)),
+        'sequence_acc_lr': float(sum(sequence_acc_lr) / max(len(sequence_acc_lr), 1)),
+        'sequence_acc_sr': float(sum(sequence_acc_sr) / max(len(sequence_acc_sr), 1)),
+        'sequence_char_acc_lr': float(sum(sequence_char_acc_lr) / max(len(sequence_char_acc_lr), 1)),
+        'sequence_char_acc_sr': float(sum(sequence_char_acc_sr) / max(len(sequence_char_acc_sr), 1)),
+    }
+    return report, seq_rows
+
+
 @register('lpsrgan_pretrain')
 def lpsrgan_pretrain(train_loader, model, optimizer, loss_fn, confusing_pair, *args):
     config = args[0]
@@ -620,6 +792,46 @@ def lpsrgan_challenge_finetune(train_loader, model, optimizer, loss_fn, confusin
     return sum(train_losses) / len(train_losses)
 
 
+@register('challenge_finetune_train')
+def challenge_finetune_train(train_loader, model, optimizer, loss_fn, confusing_pair, *args):
+    config = args[0]
+    ocr_model = _get_ocr_model(args)
+    model_g, model_d = _get_model_parts(model)
+    optimizer_g, _ = _get_optimizer_parts(optimizer)
+
+    model_g.train()
+    if model_d is not None:
+        model_d.eval()
+    if ocr_model is not None:
+        ocr_model.eval()
+
+    train_losses = []
+    pbar = tqdm(train_loader, leave=False, desc='stage3-train')
+    for idx, batch in enumerate(pbar):
+        config['_loop_step'] = idx + 1
+        lr_flat, batch_size, num_frames = _flatten_challenge_lr(batch['lr'].cuda())
+        sr_batch = model_g(lr_flat)
+        loss, metrics, _ = _compute_stage3_parseq_loss(
+            sr_batch, lr_flat, batch, config, ocr_model, batch_size, num_frames
+        )
+
+        optimizer_g.zero_grad()
+        loss.backward()
+        optimizer_g.step()
+
+        train_losses.append(metrics['total'])
+        pbar.set_postfix(
+            {
+                'loss': round(metrics['total'], 4),
+                'teacher': round(metrics['teacher'], 4),
+                'sharp': round(metrics['sharpness'], 4),
+                'cons': round(metrics['consistency'], 4),
+            }
+        )
+
+    return sum(train_losses) / len(train_losses)
+
+
 @register('lpsrgan_challenge_val')
 def lpsrgan_challenge_val(val_loader, model, loss_fn, confusing_pair, *args):
     config = args[0]
@@ -672,6 +884,74 @@ def lpsrgan_challenge_val(val_loader, model, loss_fn, confusing_pair, *args):
     report = {
         'challenge_anchor': float(sum(anchor_losses) / len(anchor_losses)),
         'challenge_ocr_loss': float(sum(ocr_losses) / len(ocr_losses)),
+    }
+    if reports:
+        keys = reports[0].keys()
+        for key in keys:
+            report[key] = float(sum(item[key] for item in reports) / len(reports))
+        _write_val_ocr_csv(epoch_rows, config)
+
+    return sum(val_losses) / len(val_losses), report
+
+
+@register('challenge_finetune_val')
+def challenge_finetune_val(val_loader, model, loss_fn, confusing_pair, *args):
+    config = args[0]
+    ocr_model = _get_ocr_model(args)
+    model_g, model_d = _get_model_parts(model)
+
+    model_g.eval()
+    if model_d is not None:
+        model_d.eval()
+    if ocr_model is not None:
+        ocr_model.eval()
+
+    val_losses = []
+    teacher_losses = []
+    sharpness_losses = []
+    consistency_losses = []
+    image_anchor_losses = []
+    reports = []
+    epoch_rows = []
+    pbar = tqdm(val_loader, leave=False, desc='stage3-val')
+    with torch.no_grad():
+        for idx, batch in enumerate(pbar):
+            config['_loop_step'] = idx + 1
+            lr_flat, batch_size, num_frames = _flatten_challenge_lr(batch['lr'].cuda())
+            sr_batch = model_g(lr_flat)
+            loss, metrics, lr_up = _compute_stage3_parseq_loss(
+                sr_batch, lr_flat, batch, config, ocr_model, batch_size, num_frames
+            )
+
+            val_losses.append(metrics['total'])
+            teacher_losses.append(metrics['teacher'])
+            sharpness_losses.append(metrics['sharpness'])
+            consistency_losses.append(metrics['consistency'])
+            image_anchor_losses.append(metrics['image_anchor'])
+
+            if ocr_model is not None:
+                flat_targets = _repeat_targets(batch['gt'], num_frames)
+                sr_eval = ocr_model.evaluate(sr_batch, flat_targets)
+                lr_eval = ocr_model.evaluate(lr_up, flat_targets)
+                batch_report, batch_rows = _collect_stage3_sequence_report(
+                    lr_eval, sr_eval, batch, batch_size, num_frames, config
+                )
+                reports.append(batch_report)
+                epoch_rows.extend(batch_rows)
+                postfix = {
+                    'loss': round(metrics['total'], 4),
+                    'score_sr': round(batch_report['mean_score_sr'], 4),
+                    'seq_sr': round(batch_report['sequence_score_sr'], 4),
+                }
+            else:
+                postfix = {'loss': round(metrics['total'], 4)}
+            pbar.set_postfix(postfix)
+
+    report = {
+        'challenge_teacher': float(sum(teacher_losses) / max(len(teacher_losses), 1)),
+        'challenge_sharpness': float(sum(sharpness_losses) / max(len(sharpness_losses), 1)),
+        'challenge_consistency': float(sum(consistency_losses) / max(len(consistency_losses), 1)),
+        'challenge_image_anchor': float(sum(image_anchor_losses) / max(len(image_anchor_losses), 1)),
     }
     if reports:
         keys = reports[0].keys()

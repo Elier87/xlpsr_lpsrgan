@@ -1,6 +1,6 @@
 model:
   name: lpsrgan
-  load: ./save/train_lpsrgan_stage2_parseq/epoch-last.pth
+  load: ./save/train_lpsrgan_stage3_finetune_parseq/epoch-last.pth
   args:
     num_blocks: 3
     dropout_prob: 0.5
