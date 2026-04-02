@@ -1,6 +1,6 @@
 model:
   name: lpsrgan
-  load: ./ckpt/best_model_Epoch_116.pth
+  load: ./save/train_lpsrgan_stage2_parseq/epoch-last.pth
   args:
     num_blocks: 3
     dropout_prob: 0.5

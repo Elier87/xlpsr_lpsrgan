@@ -419,3 +419,78 @@ class ChallengeSequenceWrapper(_BaseLPWrapper):
             'bboxes': batch_bboxes,
             'quality_scores': batch_scores,
         }
+
+
+@register('challenge_finetune_wrapper')
+class ChallengeFinetuneWrapper(ChallengeSequenceWrapper):
+    def __init__(
+        self,
+        imgW,
+        imgH,
+        aug,
+        image_aspect_ratio,
+        background,
+        bbox_margin=0.08,
+        selection='quality',
+        topk_pool=5,
+        sample_strategy='random_topk',
+        dataset=None,
+    ):
+        super().__init__(
+            imgW=imgW,
+            imgH=imgH,
+            aug=aug,
+            image_aspect_ratio=image_aspect_ratio,
+            background=background,
+            mode='single',
+            num_frames=1,
+            bbox_margin=bbox_margin,
+            selection=selection,
+            dataset=dataset,
+        )
+        self.topk_pool = max(1, int(topk_pool))
+        self.sample_strategy = sample_strategy
+
+    def _pick_candidate(self, candidates):
+        if not candidates:
+            raise RuntimeError('No challenge candidates available for finetune wrapper')
+
+        if self.sample_strategy == 'best':
+            return candidates[0]
+        if self.sample_strategy == 'random_all':
+            return random.choice(candidates)
+        if self.sample_strategy == 'random_topk':
+            return random.choice(candidates[:min(len(candidates), self.topk_pool)])
+
+        raise ValueError(f'Unsupported challenge sample_strategy: {self.sample_strategy}')
+
+    def collate_fn(self, datas):
+        batch_lrs = []
+        batch_gt = []
+        batch_names = []
+        batch_sequence_ids = []
+        batch_frame_names = []
+        batch_bboxes = []
+        batch_scores = []
+
+        for item in datas:
+            candidates = self._select_candidates(item)
+            candidate = self._pick_candidate(candidates)
+
+            batch_lrs.append(self._prepare_image(candidate['crop']))
+            batch_gt.append(item.get('gt'))
+            batch_names.append(item['sequence_id'])
+            batch_sequence_ids.append(item['sequence_id'])
+            batch_frame_names.append(candidate['frame_name'])
+            batch_bboxes.append(candidate['bbox'])
+            batch_scores.append(candidate['score'])
+
+        return {
+            'lr': torch.stack(batch_lrs),
+            'gt': batch_gt,
+            'name': batch_names,
+            'sequence_id': batch_sequence_ids,
+            'frame_name': batch_frame_names,
+            'bbox': batch_bboxes,
+            'quality_score': batch_scores,
+        }

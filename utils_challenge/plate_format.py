@@ -12,6 +12,7 @@ LETTER_POS_MAP = {
 DIGIT_POS_MAP = {
     'A': '4',
     'B': '8',
+    'C': '6',
     'D': '0',
     'G': '6',
     'I': '1',
@@ -20,12 +21,13 @@ DIGIT_POS_MAP = {
     'Q': '0',
     'S': '5',
     'T': '1',
-    'Z': '7',
+    'Z': '2',
 }
 
 FRANCE_PATTERNS = (
-    'LLDDDLL',
+    'DDDLLLDD',
     'DDDDLLDD',
+    'LLDDDLL',
 )
 
 

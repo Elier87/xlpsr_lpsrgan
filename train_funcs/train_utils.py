@@ -264,6 +264,94 @@ def _maybe_add_ocr_supervision(loss, metrics, sr_batch, batch, config, ocr_model
     return loss, metrics
 
 
+def _upsample_lr_batch(lr_batch, sr_batch, config):
+    sr_size = config.get('sr_size')
+    if sr_size is None:
+        sr_size = (sr_batch.size(2), sr_batch.size(3))
+    return F.interpolate(lr_batch, size=tuple(sr_size), mode='bilinear', align_corners=False)
+
+
+def _compute_challenge_finetune_loss(sr_batch, batch, config, ocr_model):
+    if any(gt is None for gt in batch.get('gt', [])):
+        raise RuntimeError('Stage 3 challenge finetune requires GT for every sample')
+
+    lr = batch['lr'].cuda()
+    lr_up = _upsample_lr_batch(lr, sr_batch, config)
+
+    anchor_weight = float(config.get('challenge_anchor_weight', 0.1))
+    ocr_weight = float(config.get('challenge_ocr_weight', 1.0))
+
+    anchor_loss = F.l1_loss(sr_batch, lr_up)
+    total = anchor_weight * anchor_loss
+    metrics = {
+        'anchor': float(anchor_loss.detach().item()),
+        'ocr': 0.0,
+        'total': float(total.detach().item()),
+    }
+
+    if ocr_model is not None and ocr_weight > 0.0:
+        if (
+            config.get('challenge_require_gt_ocr_loss', True)
+            and config.get('model_ocr', {}).get('name') != 'gplpr_trainable_ocr'
+        ):
+            raise RuntimeError(
+                'Stage 3 GT-based OCR finetune requires model_ocr.name == "gplpr_trainable_ocr"'
+            )
+        ocr_model.eval()
+        ocr_loss = ocr_model.training_loss(sr_batch, batch['gt'])
+        total = total + ocr_weight * ocr_loss
+        metrics['ocr'] = float(ocr_loss.detach().item())
+        metrics['total'] = float(total.detach().item())
+
+    return total, metrics, lr_up
+
+
+def _collect_ocr_report(lr_eval, sr_eval, batch, config):
+    score_conf_threshold = config.get('ocr_score_conf_threshold')
+    lr_conf_list = _normalize_confidences(lr_eval['confidences'], len(batch['gt']))
+    sr_conf_list = _normalize_confidences(sr_eval['confidences'], len(batch['gt']))
+
+    score_lr_samples = []
+    score_sr_samples = []
+    rows = []
+    for sample_idx, gt_text in enumerate(batch['gt']):
+        pred_lr = _apply_confidence_filter(
+            lr_eval['texts'][sample_idx], lr_conf_list[sample_idx], score_conf_threshold
+        )
+        pred_sr = _apply_confidence_filter(
+            sr_eval['texts'][sample_idx], sr_conf_list[sample_idx], score_conf_threshold
+        )
+        score_lr, _, _ = calc_text_score_and_acc(pred_lr, gt_text)
+        score_sr, _, _ = calc_text_score_and_acc(pred_sr, gt_text)
+        score_lr_samples.append(score_lr)
+        score_sr_samples.append(score_sr)
+        rows.append(
+            {
+                'name': batch['name'][sample_idx],
+                'gt': gt_text,
+                'pred_lr': pred_lr,
+                'pred_sr': pred_sr,
+                'conf_lr': lr_conf_list[sample_idx],
+                'conf_sr': sr_conf_list[sample_idx],
+                'score_lr': score_lr,
+                'score_sr': score_sr,
+            }
+        )
+
+    report = {
+        'ocr_score_sr': float(sr_eval['metrics']['ocr_score']),
+        'ocr_acc_sr': float(sr_eval['metrics']['ocr_acc']),
+        'ocr_char_acc_sr': float(sr_eval['metrics']['ocr_char_acc']),
+        'ocr_conf_sr': float(sr_eval['metrics']['ocr_conf']),
+        'ocr_score_lr': float(lr_eval['metrics']['ocr_score']),
+        'ocr_acc_lr': float(lr_eval['metrics']['ocr_acc']),
+        'ocr_char_acc_lr': float(lr_eval['metrics']['ocr_char_acc']),
+        'mean_score_lr': float(sum(score_lr_samples) / max(len(score_lr_samples), 1)),
+        'mean_score_sr': float(sum(score_sr_samples) / max(len(score_sr_samples), 1)),
+    }
+    return report, rows
+
+
 @register('lpsrgan_pretrain')
 def lpsrgan_pretrain(train_loader, model, optimizer, loss_fn, confusing_pair, *args):
     config = args[0]
@@ -495,6 +583,103 @@ def ocr_train(train_loader, model, optimizer, loss_fn, confusing_pair, *args):
         pbar.set_postfix({'loss': round(train_losses[-1], 4)})
 
     return sum(train_losses) / len(train_losses)
+
+
+@register('lpsrgan_challenge_finetune')
+def lpsrgan_challenge_finetune(train_loader, model, optimizer, loss_fn, confusing_pair, *args):
+    config = args[0]
+    ocr_model = _get_ocr_model(args)
+    model_g, model_d = _get_model_parts(model)
+    optimizer_g, _ = _get_optimizer_parts(optimizer)
+
+    model_g.train()
+    if model_d is not None:
+        model_d.eval()
+
+    train_losses = []
+    pbar = tqdm(train_loader, leave=False, desc='challenge-ft')
+    for idx, batch in enumerate(pbar):
+        config['_loop_step'] = idx + 1
+        lr = batch['lr'].cuda()
+        sr_batch = model_g(lr)
+        loss, metrics, _ = _compute_challenge_finetune_loss(sr_batch, batch, config, ocr_model)
+
+        optimizer_g.zero_grad()
+        loss.backward()
+        optimizer_g.step()
+
+        train_losses.append(metrics['total'])
+        pbar.set_postfix(
+            {
+                'loss': round(metrics['total'], 4),
+                'ocr': round(metrics['ocr'], 4),
+                'anchor': round(metrics['anchor'], 4),
+            }
+        )
+
+    return sum(train_losses) / len(train_losses)
+
+
+@register('lpsrgan_challenge_val')
+def lpsrgan_challenge_val(val_loader, model, loss_fn, confusing_pair, *args):
+    config = args[0]
+    ocr_model = _get_ocr_model(args)
+    model_g, model_d = _get_model_parts(model)
+
+    model_g.eval()
+    if model_d is not None:
+        model_d.eval()
+    if ocr_model is not None:
+        ocr_model.eval()
+
+    val_losses = []
+    anchor_losses = []
+    ocr_losses = []
+    epoch_rows = []
+    reports = []
+    pbar = tqdm(val_loader, leave=False, desc='challenge-val')
+    with torch.no_grad():
+        for idx, batch in enumerate(pbar):
+            config['_loop_step'] = idx + 1
+            lr = batch['lr'].cuda()
+            sr_batch = model_g(lr)
+            loss, metrics, lr_up = _compute_challenge_finetune_loss(
+                sr_batch, batch, config, ocr_model
+            )
+
+            val_losses.append(metrics['total'])
+            anchor_losses.append(metrics['anchor'])
+            ocr_losses.append(metrics['ocr'])
+
+            if ocr_model is not None:
+                sr_eval = ocr_model.evaluate(sr_batch, batch['gt'])
+                lr_eval = ocr_model.evaluate(lr_up, batch['gt'])
+                batch_report, batch_rows = _collect_ocr_report(lr_eval, sr_eval, batch, config)
+                reports.append(batch_report)
+                epoch_rows.extend(batch_rows)
+                postfix = {
+                    'loss': round(metrics['total'], 4),
+                    'ocr_sr': round(batch_report['ocr_score_sr'], 4),
+                    'score_sr': round(batch_report['mean_score_sr'], 4),
+                }
+            else:
+                postfix = {
+                    'loss': round(metrics['total'], 4),
+                    'anchor': round(metrics['anchor'], 4),
+                }
+            pbar.set_postfix(postfix)
+
+    report = {
+        'challenge_anchor': float(sum(anchor_losses) / len(anchor_losses)),
+        'challenge_ocr_loss': float(sum(ocr_losses) / len(ocr_losses)),
+    }
+    if reports:
+        keys = reports[0].keys()
+        for key in keys:
+            report[key] = float(sum(item[key] for item in reports) / len(reports))
+        _write_val_ocr_csv(epoch_rows, config)
+
+    return sum(val_losses) / len(val_losses), report
 
 
 @register('ocr_val')
