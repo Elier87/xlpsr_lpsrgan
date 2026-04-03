@@ -7,7 +7,7 @@ def align_prediction_to_gt(pred, gt):
     gt = (gt or '').strip()
     gt_len = len(gt)
 
-    pred_chars = list(pred[:gt_len])
+    pred_chars = [('' if ch == ' ' else ch) for ch in pred[:gt_len]]
     if len(pred_chars) < gt_len:
         pred_chars += [''] * (gt_len - len(pred_chars))
     return pred_chars, list(gt)

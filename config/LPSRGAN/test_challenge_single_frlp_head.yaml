@@ -1,0 +1,53 @@
+model:
+  name: lpsrgan
+  load: ./save/train_lpsrgan_stage3_frlp_head/epoch-last.pth
+  args:
+    num_blocks: 3
+    dropout_prob: 0.5
+
+model_ocr:
+  name: parseq_frlp_head
+  freeze: True
+  args:
+    hub_repo: baudm/parseq
+    model_name: parseq
+    pretrained: True
+    load: ./save/train_lpsrgan_stage3_frlp_head/epoch-last.pth
+    img_size: [32, 128]
+    source: github
+    hidden_dim: 64
+    dropout: 0.1
+    max_plate_len: 8
+    confidence_threshold: 0.65
+    freeze_backbone: True
+
+test_dataset:
+  dataset:
+    name: challenge_sequence
+    args:
+      root: ./xlpsr/val_data/challenge_public_set_final
+      ground_truth_csv: ./xlpsr/val_data/challenge_public_set_final/ground_truth.csv
+  wrapper:
+    name: challenge_sequence_wrapper
+    args:
+      imgW: 48
+      imgH: 16
+      aug: False
+      image_aspect_ratio: 3
+      background: (127, 127, 127)
+      mode: single
+      num_frames: 1
+      bbox_margin: 0.08
+      selection: quality
+  batch: 1
+
+sr_size: [32, 96]
+decision_strategy: most_frequent
+fusion_strategy: none
+prediction_filename: prediction.csv
+debug_filename: challenge_debug.csv
+frlp_conf_threshold: 0.65
+
+plate_format:
+  enabled: True
+  country: fr

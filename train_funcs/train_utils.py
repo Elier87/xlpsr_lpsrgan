@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from models.ocr_adapters import calc_text_score_and_acc
 from train_funcs import register
-from utils_challenge import aggregate_sequence_predictions
+from utils_challenge import aggregate_sequence_predictions, save_challenge_debug_image
 
 
 def save_visualized_images(
@@ -147,6 +147,12 @@ def _get_ocr_model(args):
     return args[1] if len(args) > 1 else None
 
 
+def _get_ocr_optimizer(optimizer):
+    if isinstance(optimizer, (tuple, list)) and len(optimizer) > 2:
+        return optimizer[2]
+    return None
+
+
 def _get_ocr_input(batch, config):
     input_key = config.get('ocr_input_key', 'hr')
     if input_key not in batch:
@@ -166,6 +172,26 @@ def _normalize_confidences(confidences, batch_size):
                 values.append(float(item))
         return values
     return [float(confidences)] * batch_size
+
+
+def _ocr_predict(model_ocr, images, config=None):
+    kwargs = {}
+    if config is not None and config.get('frlp_conf_threshold') is not None:
+        kwargs['confidence_threshold'] = config['frlp_conf_threshold']
+    try:
+        return model_ocr.predict(images, **kwargs)
+    except TypeError:
+        return model_ocr.predict(images)
+
+
+def _ocr_evaluate(model_ocr, images, targets, config=None):
+    kwargs = {}
+    if config is not None and config.get('frlp_conf_threshold') is not None:
+        kwargs['confidence_threshold'] = config['frlp_conf_threshold']
+    try:
+        return model_ocr.evaluate(images, targets, **kwargs)
+    except TypeError:
+        return model_ocr.evaluate(images, targets)
 
 
 def _apply_confidence_filter(pred, conf, threshold):
@@ -195,6 +221,7 @@ def _write_val_ocr_csv(rows, config):
         writer = csv.DictWriter(
             f,
             fieldnames=['name', 'gt', 'pred_lr', 'pred_sr', 'conf_lr', 'conf_sr', 'score_lr', 'score_sr'],
+            extrasaction='ignore',
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -522,6 +549,161 @@ def _collect_stage3_sequence_report(lr_eval, sr_eval, batch, batch_size, num_fra
         'sequence_char_acc_sr': float(sum(sequence_char_acc_sr) / max(len(sequence_char_acc_sr), 1)),
     }
     return report, seq_rows
+
+
+def _save_stage3_val_visualizations(batch, lr_up, sr_batch, sample_rows, config, start_idx, num_frames):
+    save_root = config.get('save_path')
+    epoch = config.get('epoch')
+    if save_root is None or epoch is None:
+        return 0
+
+    max_visuals = int(config.get('val_visualize_max_samples', 16))
+    if start_idx >= max_visuals:
+        return 0
+
+    output_dir = Path(save_root) / 'val_ocr' / f'epoch_{int(epoch):03d}_imgs'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    remaining = max_visuals - start_idx
+    save_count = min(len(sample_rows), remaining)
+
+    for local_idx in range(save_count):
+        row = sample_rows[local_idx]
+        frame_idx = local_idx * num_frames
+        lr_image = transforms.ToPILImage()(lr_up[frame_idx].detach().cpu())
+        sr_image = transforms.ToPILImage()(sr_batch[frame_idx].detach().cpu())
+        image_name = str(row['name']).replace('/', '_')
+        output_path = output_dir / f'{start_idx + local_idx:02d}_{image_name}.png'
+        save_challenge_debug_image(
+            lr_image,
+            sr_image,
+            output_path,
+            gt_text=row['gt'],
+            lr_pred=row['pred_lr'],
+            sr_pred=row['pred_sr'],
+            score_lr=row['score_lr'],
+            score_sr=row['score_sr'],
+            final_pred=row.get('final_pred'),
+        )
+    return save_count
+
+
+def _maybe_visualize_stage3(batch, lr_up, sr_batch, config, sample_rows=None, num_frames=1):
+    visualize_interval = config.get('visualize_interval', 0)
+    current_step = config.get('_loop_step', 0)
+    if not visualize_interval or current_step % visualize_interval != 0:
+        return
+
+    save_name = config.get('tag_view')
+    if not save_name:
+        return
+
+    output_path = Path(f"{config['model']['name']}_{save_name}.png")
+    row = sample_rows[0] if sample_rows else None
+    lr_image = transforms.ToPILImage()(lr_up[0].detach().cpu())
+    sr_image = transforms.ToPILImage()(sr_batch[0].detach().cpu())
+    save_challenge_debug_image(
+        lr_image,
+        sr_image,
+        output_path,
+        gt_text=row.get('gt') if row else batch['gt'][0],
+        lr_pred=row.get('pred_lr') if row else None,
+        sr_pred=row.get('pred_sr') if row else None,
+        score_lr=row.get('score_lr') if row else None,
+        score_sr=row.get('score_sr') if row else None,
+        final_pred=row.get('final_pred') if row else None,
+    )
+
+
+def _collect_stage3_frlp_report(lr_outputs, sr_outputs, batch, batch_size, num_frames, config):
+    flat_targets = _repeat_targets(batch['gt'], num_frames)
+    lr_texts = list(lr_outputs['texts'])
+    sr_texts = list(sr_outputs['texts'])
+    lr_conf_flat = _normalize_confidences(lr_outputs['confidences'], len(flat_targets))
+    sr_conf_flat = _normalize_confidences(sr_outputs['confidences'], len(flat_targets))
+
+    frame_score_lr = []
+    frame_score_sr = []
+    frame_exact_lr = []
+    frame_exact_sr = []
+    frame_char_acc_lr = []
+    frame_char_acc_sr = []
+
+    for idx, gt_text in enumerate(flat_targets):
+        score_lr, exact_lr, char_acc_lr = calc_text_score_and_acc(lr_texts[idx], gt_text)
+        score_sr, exact_sr, char_acc_sr = calc_text_score_and_acc(sr_texts[idx], gt_text)
+        frame_score_lr.append(score_lr)
+        frame_score_sr.append(score_sr)
+        frame_exact_lr.append(exact_lr)
+        frame_exact_sr.append(exact_sr)
+        frame_char_acc_lr.append(char_acc_lr)
+        frame_char_acc_sr.append(char_acc_sr)
+
+    lr_texts_by_seq = _chunk_list(lr_texts, batch_size, num_frames)
+    sr_texts_by_seq = _chunk_list(sr_texts, batch_size, num_frames)
+    lr_conf_by_seq = _chunk_list(lr_conf_flat, batch_size, num_frames)
+    sr_conf_by_seq = _chunk_list(sr_conf_flat, batch_size, num_frames)
+
+    decision_strategy = config.get('decision_strategy', 'most_frequent')
+    rows = []
+    sequence_score_lr = []
+    sequence_score_sr = []
+    sequence_exact_lr = []
+    sequence_exact_sr = []
+    sequence_char_acc_lr = []
+    sequence_char_acc_sr = []
+
+    for sample_idx, gt_text in enumerate(batch['gt']):
+        pred_lr_final = aggregate_sequence_predictions(
+            lr_texts_by_seq[sample_idx], lr_conf_by_seq[sample_idx], strategy=decision_strategy
+        )
+        pred_sr_final = aggregate_sequence_predictions(
+            sr_texts_by_seq[sample_idx], sr_conf_by_seq[sample_idx], strategy=decision_strategy
+        )
+
+        score_lr, exact_lr, char_acc_lr = calc_text_score_and_acc(pred_lr_final, gt_text)
+        score_sr, exact_sr, char_acc_sr = calc_text_score_and_acc(pred_sr_final, gt_text)
+        sequence_score_lr.append(score_lr)
+        sequence_score_sr.append(score_sr)
+        sequence_exact_lr.append(exact_lr)
+        sequence_exact_sr.append(exact_sr)
+        sequence_char_acc_lr.append(char_acc_lr)
+        sequence_char_acc_sr.append(char_acc_sr)
+
+        rows.append(
+            {
+                'name': batch['name'][sample_idx],
+                'gt': gt_text,
+                'pred_lr': pred_lr_final,
+                'pred_sr': pred_sr_final,
+                'conf_lr': max(lr_conf_by_seq[sample_idx]) if lr_conf_by_seq[sample_idx] else 0.0,
+                'conf_sr': max(sr_conf_by_seq[sample_idx]) if sr_conf_by_seq[sample_idx] else 0.0,
+                'score_lr': score_lr,
+                'score_sr': score_sr,
+                'pred_lr_frames': '|'.join(lr_texts_by_seq[sample_idx]),
+                'pred_sr_frames': '|'.join(sr_texts_by_seq[sample_idx]),
+                'final_pred': pred_sr_final,
+            }
+        )
+
+    report = {
+        'avg_score_lr': float(sum(sequence_score_lr) / max(len(sequence_score_lr), 1)),
+        'avg_score_sr': float(sum(sequence_score_sr) / max(len(sequence_score_sr), 1)),
+        'exact_acc_lr': float(sum(sequence_exact_lr) / max(len(sequence_exact_lr), 1)),
+        'exact_acc_sr': float(sum(sequence_exact_sr) / max(len(sequence_exact_sr), 1)),
+        'char_acc_lr': float(sum(sequence_char_acc_lr) / max(len(sequence_char_acc_lr), 1)),
+        'char_acc_sr': float(sum(sequence_char_acc_sr) / max(len(sequence_char_acc_sr), 1)),
+        'sequence_score_lr': float(sum(sequence_score_lr) / max(len(sequence_score_lr), 1)),
+        'sequence_score_sr': float(sum(sequence_score_sr) / max(len(sequence_score_sr), 1)),
+        'frame_score_lr': float(sum(frame_score_lr) / max(len(frame_score_lr), 1)),
+        'frame_score_sr': float(sum(frame_score_sr) / max(len(frame_score_sr), 1)),
+        'frame_exact_acc_lr': float(sum(frame_exact_lr) / max(len(frame_exact_lr), 1)),
+        'frame_exact_acc_sr': float(sum(frame_exact_sr) / max(len(frame_exact_sr), 1)),
+        'frame_char_acc_lr': float(sum(frame_char_acc_lr) / max(len(frame_char_acc_lr), 1)),
+        'frame_char_acc_sr': float(sum(frame_char_acc_sr) / max(len(frame_char_acc_sr), 1)),
+        'conf_lr': float(sum(lr_conf_flat) / max(len(lr_conf_flat), 1)),
+        'conf_sr': float(sum(sr_conf_flat) / max(len(sr_conf_flat), 1)),
+    }
+    return report, rows
 
 
 @register('lpsrgan_pretrain')
@@ -960,6 +1142,198 @@ def challenge_finetune_val(val_loader, model, loss_fn, confusing_pair, *args):
         _write_val_ocr_csv(epoch_rows, config)
 
     return sum(val_losses) / len(val_losses), report
+
+
+@register('challenge_frlp_head_train')
+def challenge_frlp_head_train(train_loader, model, optimizer, loss_fn, confusing_pair, *args):
+    config = args[0]
+    ocr_model = _get_ocr_model(args)
+    model_g, model_d = _get_model_parts(model)
+    optimizer_g, _ = _get_optimizer_parts(optimizer)
+    optimizer_ocr = _get_ocr_optimizer(optimizer)
+
+    if ocr_model is None or not hasattr(ocr_model, 'compute_task_loss'):
+        raise RuntimeError('challenge_frlp_head_train requires model_ocr=parseq_frlp_head')
+    if optimizer_ocr is None:
+        raise RuntimeError('Stage 3 FRLP head training requires optimizer_ocr')
+
+    model_g.train()
+    if model_d is not None:
+        model_d.eval()
+    ocr_model.train()
+
+    train_losses = []
+    token_losses = []
+    position_losses = []
+    length_losses = []
+    image_reg_losses = []
+    report_sums = {}
+    report_count = 0
+
+    pbar = tqdm(train_loader, leave=False, desc='stage3-frlp-train')
+    for idx, batch in enumerate(pbar):
+        config['_loop_step'] = idx + 1
+        lr_flat, batch_size, num_frames = _flatten_challenge_lr(batch['lr'].cuda())
+        flat_targets = _repeat_targets(batch['gt'], num_frames)
+        sr_batch = model_g(lr_flat)
+        lr_up = _upsample_lr_batch(lr_flat, sr_batch, config)
+
+        loss, metrics, sr_outputs = ocr_model.compute_task_loss(
+            sr_batch,
+            flat_targets,
+            token_ce_weight=float(config.get('frlp_token_ce_weight', 1.0)),
+            position_ce_weight=float(config.get('frlp_position_ce_weight', 0.2)),
+            length_weight=float(config.get('frlp_length_weight', 0.2)),
+            score_weight=float(config.get('frlp_score_weight', 0.0)),
+            confidence_threshold=config.get('frlp_conf_threshold'),
+        )
+
+        image_reg_weight = float(config.get('optional_image_regularization_weight', 0.0))
+        image_reg_loss = torch.zeros((), device=sr_batch.device)
+        if image_reg_weight > 0.0:
+            image_reg_loss = F.l1_loss(sr_batch, lr_up)
+            loss = loss + image_reg_weight * image_reg_loss
+
+        optimizer_g.zero_grad()
+        optimizer_ocr.zero_grad()
+        loss.backward()
+        optimizer_g.step()
+        optimizer_ocr.step()
+
+        with torch.no_grad():
+            lr_outputs = _ocr_predict(ocr_model, lr_up, config)
+        batch_report, batch_rows = _collect_stage3_frlp_report(
+            lr_outputs, sr_outputs, batch, batch_size, num_frames, config
+        )
+        _maybe_visualize_stage3(
+            batch, lr_up, sr_batch, config, sample_rows=batch_rows, num_frames=num_frames
+        )
+
+        metrics['total'] = float(loss.detach().item())
+        metrics['image_reg'] = float(image_reg_loss.detach().item())
+        train_losses.append(metrics['total'])
+        token_losses.append(metrics['token_ce'])
+        position_losses.append(metrics['position_ce'])
+        length_losses.append(metrics['length_ce'])
+        image_reg_losses.append(metrics['image_reg'])
+        for key, value in batch_report.items():
+            report_sums[key] = report_sums.get(key, 0.0) + float(value)
+        report_count += 1
+
+        pbar.set_postfix(
+            {
+                'loss': round(metrics['total'], 4),
+                'score_sr': round(batch_report['avg_score_sr'], 4),
+                'score_lr': round(batch_report['avg_score_lr'], 4),
+                'tok': round(metrics['token_ce'], 4),
+            }
+        )
+
+    report = {
+        'avg_loss': float(sum(train_losses) / max(len(train_losses), 1)),
+        'avg_score_sr': float(report_sums.get('avg_score_sr', 0.0) / max(report_count, 1)),
+        'avg_score_lr': float(report_sums.get('avg_score_lr', 0.0) / max(report_count, 1)),
+        'exact_acc_sr': float(report_sums.get('exact_acc_sr', 0.0) / max(report_count, 1)),
+        'char_acc_sr': float(report_sums.get('char_acc_sr', 0.0) / max(report_count, 1)),
+        'sequence_score_sr': float(report_sums.get('sequence_score_sr', 0.0) / max(report_count, 1)),
+        'token_ce': float(sum(token_losses) / max(len(token_losses), 1)),
+        'position_ce': float(sum(position_losses) / max(len(position_losses), 1)),
+        'length_ce': float(sum(length_losses) / max(len(length_losses), 1)),
+        'image_reg': float(sum(image_reg_losses) / max(len(image_reg_losses), 1)),
+    }
+    return report['avg_loss'], report
+
+
+@register('challenge_frlp_head_val')
+def challenge_frlp_head_val(val_loader, model, loss_fn, confusing_pair, *args):
+    config = args[0]
+    ocr_model = _get_ocr_model(args)
+    model_g, model_d = _get_model_parts(model)
+
+    if ocr_model is None or not hasattr(ocr_model, 'compute_task_loss'):
+        raise RuntimeError('challenge_frlp_head_val requires model_ocr=parseq_frlp_head')
+
+    model_g.eval()
+    if model_d is not None:
+        model_d.eval()
+    ocr_model.eval()
+
+    val_losses = []
+    token_losses = []
+    position_losses = []
+    length_losses = []
+    image_reg_losses = []
+    report_sums = {}
+    report_count = 0
+    epoch_rows = []
+    saved_visuals = 0
+
+    pbar = tqdm(val_loader, leave=False, desc='stage3-frlp-val')
+    with torch.no_grad():
+        for idx, batch in enumerate(pbar):
+            config['_loop_step'] = idx + 1
+            lr_flat, batch_size, num_frames = _flatten_challenge_lr(batch['lr'].cuda())
+            flat_targets = _repeat_targets(batch['gt'], num_frames)
+            sr_batch = model_g(lr_flat)
+            lr_up = _upsample_lr_batch(lr_flat, sr_batch, config)
+
+            loss, metrics, sr_outputs = ocr_model.compute_task_loss(
+                sr_batch,
+                flat_targets,
+                token_ce_weight=float(config.get('frlp_token_ce_weight', 1.0)),
+                position_ce_weight=float(config.get('frlp_position_ce_weight', 0.2)),
+                length_weight=float(config.get('frlp_length_weight', 0.2)),
+                score_weight=float(config.get('frlp_score_weight', 0.0)),
+                confidence_threshold=config.get('frlp_conf_threshold'),
+            )
+
+            image_reg_weight = float(config.get('optional_image_regularization_weight', 0.0))
+            image_reg_loss = torch.zeros((), device=sr_batch.device)
+            if image_reg_weight > 0.0:
+                image_reg_loss = F.l1_loss(sr_batch, lr_up)
+                loss = loss + image_reg_weight * image_reg_loss
+
+            lr_outputs = _ocr_predict(ocr_model, lr_up, config)
+            batch_report, batch_rows = _collect_stage3_frlp_report(
+                lr_outputs, sr_outputs, batch, batch_size, num_frames, config
+            )
+
+            val_losses.append(float(loss.detach().item()))
+            token_losses.append(metrics['token_ce'])
+            position_losses.append(metrics['position_ce'])
+            length_losses.append(metrics['length_ce'])
+            image_reg_losses.append(float(image_reg_loss.detach().item()))
+            for key, value in batch_report.items():
+                report_sums[key] = report_sums.get(key, 0.0) + float(value)
+            report_count += 1
+            epoch_rows.extend(batch_rows)
+            saved_visuals += _save_stage3_val_visualizations(
+                batch, lr_up, sr_batch, batch_rows, config, saved_visuals, num_frames
+            )
+
+            pbar.set_postfix(
+                {
+                    'loss': round(val_losses[-1], 4),
+                    'score_sr': round(batch_report['avg_score_sr'], 4),
+                    'score_lr': round(batch_report['avg_score_lr'], 4),
+                }
+            )
+
+    _write_val_ocr_csv(epoch_rows, config)
+    report = {
+        'avg_loss': float(sum(val_losses) / max(len(val_losses), 1)),
+        'avg_score_sr': float(report_sums.get('avg_score_sr', 0.0) / max(report_count, 1)),
+        'avg_score_lr': float(report_sums.get('avg_score_lr', 0.0) / max(report_count, 1)),
+        'exact_acc_sr': float(report_sums.get('exact_acc_sr', 0.0) / max(report_count, 1)),
+        'char_acc_sr': float(report_sums.get('char_acc_sr', 0.0) / max(report_count, 1)),
+        'sequence_score_sr': float(report_sums.get('sequence_score_sr', 0.0) / max(report_count, 1)),
+        'sequence_score_lr': float(report_sums.get('sequence_score_lr', 0.0) / max(report_count, 1)),
+        'token_ce': float(sum(token_losses) / max(len(token_losses), 1)),
+        'position_ce': float(sum(position_losses) / max(len(position_losses), 1)),
+        'length_ce': float(sum(length_losses) / max(len(length_losses), 1)),
+        'image_reg': float(sum(image_reg_losses) / max(len(image_reg_losses), 1)),
+    }
+    return report['avg_loss'], report
 
 
 @register('ocr_val')

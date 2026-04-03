@@ -6,6 +6,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models import register
+from utils_challenge.frlp import (
+    FRLP_BLANK_ID,
+    FRLP_EOS_ID,
+    FRLP_TYPE_VOCAB_SIZE,
+    FRLP_VOCAB_SIZE,
+    decode_frlp_batch,
+    encode_frlp_targets,
+    score_to_unit_interval,
+)
 from .GP_LPR_arch import make_GPLPR
 
 
@@ -14,7 +23,7 @@ def align_prediction_to_gt(pred, gt):
     gt = gt.strip()
     gt_len = len(gt)
 
-    pred_chars = list(pred[:gt_len])
+    pred_chars = [('' if ch == ' ' else ch) for ch in pred[:gt_len]]
     if len(pred_chars) < gt_len:
         pred_chars += [''] * (gt_len - len(pred_chars))
     return pred_chars, list(gt)
@@ -79,6 +88,13 @@ class BaseOCRAdapter(nn.Module):
         self.eval()
         for param in self.parameters():
             param.requires_grad = False
+        return self
+
+    def get_trainable_state_dict(self):
+        return self.state_dict()
+
+    def load_trainable_state_dict(self, state_dict):
+        self.load_state_dict(state_dict, strict=False)
         return self
 
     def OCR_pred(self, images):
@@ -452,3 +468,200 @@ class PARSeqOCRAdapter(BaseOCRAdapter):
         # Fallback for settings without paired reference images:
         # keep the OCR distribution sharp so SR does not collapse into low-confidence text.
         return self._entropy_regularization(student_logits)
+
+
+@register('parseq_frlp_head')
+class PARSeqFRLPHeadAdapter(PARSeqOCRAdapter):
+    def __init__(
+        self,
+        hub_repo='baudm/parseq',
+        model_name='parseq',
+        pretrained=True,
+        load=None,
+        img_size=None,
+        source='github',
+        hidden_dim=64,
+        dropout=0.1,
+        max_plate_len=8,
+        confidence_threshold=0.65,
+        freeze_backbone=True,
+    ):
+        self.hidden_dim = hidden_dim
+        self.dropout_prob = dropout
+        self.max_plate_len = max_plate_len
+        self.max_steps = max_plate_len + 1
+        self.confidence_threshold = confidence_threshold
+        self.freeze_backbone_flag = freeze_backbone
+
+        super().__init__(
+            hub_repo=hub_repo,
+            model_name=model_name,
+            pretrained=pretrained,
+            load=None,
+            img_size=img_size,
+            source=source,
+        )
+
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, self.img_size[0], self.img_size[1])
+            parseq_dim = super().forward_logits(dummy).size(-1)
+
+        self.feature_projection = nn.Linear(parseq_dim, hidden_dim)
+        self.feature_norm = nn.LayerNorm(hidden_dim)
+        self.position_embedding = nn.Parameter(torch.zeros(1, self.max_steps, hidden_dim))
+        self.dropout = nn.Dropout(dropout)
+        self.token_head = nn.Linear(hidden_dim, FRLP_VOCAB_SIZE)
+        self.type_head = nn.Linear(hidden_dim, FRLP_TYPE_VOCAB_SIZE)
+        self.length_head = nn.Linear(hidden_dim, 1)
+
+        if freeze_backbone:
+            self.freeze_backbone()
+        else:
+            self.unfreeze_backbone()
+
+        if load is not None:
+            self._load_trainable_from_path(load)
+
+    def freeze_backbone(self):
+        self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
+        return self
+
+    def unfreeze_backbone(self):
+        for param in self.model.parameters():
+            param.requires_grad = True
+        return self
+
+    def freeze(self):
+        self.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+        return self
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_backbone_flag:
+            self.model.eval()
+        return self
+
+    def get_trainable_state_dict(self):
+        state_dict = self.state_dict()
+        return {key: value for key, value in state_dict.items() if not key.startswith('model.')}
+
+    def _load_trainable_from_path(self, load_path):
+        ckpt = torch.load(load_path, map_location='cpu')
+        state_dict = ckpt
+        if isinstance(ckpt, dict):
+            if 'model_ocr' in ckpt and isinstance(ckpt['model_ocr'], dict):
+                state_dict = ckpt['model_ocr'].get(
+                    'trainable_sd',
+                    ckpt['model_ocr'].get('sd', ckpt['model_ocr']),
+                )
+            else:
+                state_dict = ckpt.get('trainable_sd', ckpt.get('state_dict', ckpt))
+        self.load_trainable_state_dict(state_dict)
+
+    def _extract_hidden(self, images):
+        parseq_logits = super().forward_logits(images)
+        if parseq_logits.size(1) < self.max_steps:
+            pad_steps = self.max_steps - parseq_logits.size(1)
+            parseq_logits = F.pad(parseq_logits, (0, 0, 0, pad_steps))
+        parseq_logits = parseq_logits[:, :self.max_steps, :]
+
+        hidden = self.feature_projection(parseq_logits)
+        hidden = self.feature_norm(hidden + self.position_embedding[:, :hidden.size(1), :])
+        hidden = self.dropout(F.gelu(hidden))
+        return hidden, parseq_logits
+
+    def forward_frlp(self, images):
+        hidden, parseq_logits = self._extract_hidden(images)
+        token_logits = self.token_head(hidden)
+        type_logits = self.type_head(hidden)
+        eos_logits = self.length_head(hidden).squeeze(-1)
+        return {
+            'parseq_logits': parseq_logits,
+            'hidden': hidden,
+            'token_logits': token_logits,
+            'type_logits': type_logits,
+            'eos_logits': eos_logits,
+        }
+
+    def forward_logits(self, images):
+        return self.forward_frlp(images)['token_logits']
+
+    def _decode_outputs(self, outputs, confidence_threshold=None):
+        threshold = self.confidence_threshold if confidence_threshold is None else confidence_threshold
+        decoded = decode_frlp_batch(
+            outputs['token_logits'],
+            eos_logits=outputs['eos_logits'],
+            confidence_threshold=threshold,
+        )
+        decoded['position_logits'] = outputs['type_logits']
+        decoded['length_logits'] = outputs['eos_logits']
+        decoded['logits'] = outputs['token_logits']
+        return decoded
+
+    def predict(self, images, confidence_threshold=None):
+        outputs = self.forward_frlp(images)
+        return self._decode_outputs(outputs, confidence_threshold=confidence_threshold)
+
+    def evaluate(self, images, targets=None, confidence_threshold=None):
+        outputs = self.predict(images, confidence_threshold=confidence_threshold)
+        metrics = summarize_ocr_metrics(
+            outputs['texts'], targets or [], outputs.get('confidences')
+        )
+        outputs['metrics'] = metrics
+        return outputs
+
+    def compute_task_loss(
+        self,
+        images,
+        targets,
+        token_ce_weight=1.0,
+        position_ce_weight=0.2,
+        length_weight=0.2,
+        score_weight=0.0,
+        confidence_threshold=None,
+    ):
+        outputs = self.forward_frlp(images)
+        encoded = encode_frlp_targets(targets, max_steps=self.max_steps)
+        token_targets = encoded['token_targets'].to(images.device)
+        type_targets = encoded['type_targets'].to(images.device)
+        eos_positions = encoded['eos_positions'].to(images.device)
+
+        token_loss = F.cross_entropy(
+            outputs['token_logits'].reshape(-1, FRLP_VOCAB_SIZE),
+            token_targets.reshape(-1),
+        )
+        position_loss = F.cross_entropy(
+            outputs['type_logits'].reshape(-1, FRLP_TYPE_VOCAB_SIZE),
+            type_targets.reshape(-1),
+        )
+        length_loss = F.cross_entropy(outputs['eos_logits'], eos_positions)
+
+        total = (
+            token_ce_weight * token_loss
+            + position_ce_weight * position_loss
+            + length_weight * length_loss
+        )
+
+        decoded = self._decode_outputs(outputs, confidence_threshold=confidence_threshold)
+        metrics = summarize_ocr_metrics(
+            decoded['texts'], encoded['normalized_targets'], decoded.get('confidences')
+        )
+        metrics.update(
+            {
+                'token_ce': float(token_loss.detach().item()),
+                'position_ce': float(position_loss.detach().item()),
+                'length_ce': float(length_loss.detach().item()),
+                'score_norm': score_to_unit_interval(metrics['ocr_score']),
+                'score_surrogate': 0.0,
+                'total': float(total.detach().item()),
+            }
+        )
+        if score_weight > 0.0:
+            metrics['score_surrogate'] = 0.0
+
+        decoded['metrics'] = metrics
+        return total, metrics, decoded

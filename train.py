@@ -69,6 +69,19 @@ def _get_model_for_save(model):
 
 
 def _make_optimizer_pair(model):
+    return _make_optimizer_bundle(model)
+
+
+def _get_single_optimizer_spec(config_obj):
+    optimizer_spec = config_obj.get('optimizer', config_obj.get('optimizer_g'))
+    if optimizer_spec is None:
+        raise KeyError('Single-model training requires optimizer or optimizer_g')
+    return optimizer_spec
+
+
+def _make_optimizer_bundle(model, model_ocr=None):
+    optimizers = []
+
     if _is_multi_model(model):
         optimizer_default = config.get('optimizer')
         optimizer_g_spec = config.get('optimizer_g', optimizer_default)
@@ -77,12 +90,25 @@ def _make_optimizer_pair(model):
             raise KeyError('Tuple model training requires optimizer_g and optimizer_d')
         optimizer_g = utils.make_optimizer(model[0].parameters(), optimizer_g_spec)
         optimizer_d = utils.make_optimizer(model[1].parameters(), optimizer_d_spec)
-        return optimizer_g, optimizer_d
-    optimizer = utils.make_optimizer(model.parameters(), config['optimizer'])
-    return optimizer
+        optimizers.extend([optimizer_g, optimizer_d])
+    else:
+        optimizer = utils.make_optimizer(model.parameters(), _get_single_optimizer_spec(config))
+        optimizers.append(optimizer)
+
+    if model_ocr is not None and config.get('optimizer_ocr') is not None:
+        ocr_params = [param for param in model_ocr.parameters() if param.requires_grad]
+        if ocr_params:
+            optimizer_ocr = utils.make_optimizer(ocr_params, config['optimizer_ocr'])
+            optimizers.append(optimizer_ocr)
+
+    if len(optimizers) == 1:
+        return optimizers[0]
+    return tuple(optimizers)
 
 
-def _load_optimizer_pair(model, sv_file):
+def _load_optimizer_pair(model, sv_file, model_ocr=None):
+    optimizers = []
+
     if _is_multi_model(model):
         optimizer_g = utils.make_optimizer(
             model[0].parameters(), sv_file['optimizer_g'], load_optimizer=True
@@ -90,11 +116,23 @@ def _load_optimizer_pair(model, sv_file):
         optimizer_d = utils.make_optimizer(
             model[1].parameters(), sv_file['optimizer_d'], load_optimizer=True
         )
-        return optimizer_g, optimizer_d
+        optimizers.extend([optimizer_g, optimizer_d])
+    else:
+        optimizer_spec = sv_file.get('optimizer', sv_file.get('optimizer_g'))
+        optimizers.append(
+            utils.make_optimizer(model.parameters(), optimizer_spec, load_optimizer=True)
+        )
 
-    return utils.make_optimizer(
-        model.parameters(), sv_file['optimizer'], load_optimizer=True
-    )
+    if model_ocr is not None and 'optimizer_ocr' in sv_file:
+        ocr_params = [param for param in model_ocr.parameters() if param.requires_grad]
+        if ocr_params:
+            optimizers.append(
+                utils.make_optimizer(ocr_params, sv_file['optimizer_ocr'], load_optimizer=True)
+            )
+
+    if len(optimizers) == 1:
+        return optimizers[0]
+    return tuple(optimizers)
 
 
 def _make_scheduler(optimizer, state_dict=None):
@@ -133,12 +171,35 @@ def _prepare_ocr_model():
     return model_ocr.cuda()
 
 
+def _prepare_ocr_model_from_resume(sv_file=None):
+    ocr_spec = config.get('model_ocr')
+    if ocr_spec is None:
+        return None
+
+    if sv_file is not None and 'model_ocr' in sv_file:
+        saved_ocr_spec = copy.deepcopy(sv_file['model_ocr'])
+        model_ocr = models.make(saved_ocr_spec)
+        if 'trainable_sd' in saved_ocr_spec and hasattr(model_ocr, 'load_trainable_state_dict'):
+            model_ocr.load_trainable_state_dict(saved_ocr_spec['trainable_sd'])
+        elif 'sd' in saved_ocr_spec:
+            model_ocr.load_state_dict(saved_ocr_spec['sd'], strict=False)
+    else:
+        model_ocr = models.make(ocr_spec)
+
+    if model_ocr is None:
+        return None
+    if ocr_spec.get('freeze', True) and hasattr(model_ocr, 'freeze'):
+        model_ocr.freeze()
+    return model_ocr.cuda()
+
+
 def prepare_training():
     if config.get('resume') is not None:
         sv_file = torch.load(config['resume'], map_location='cpu')
         model = models.make(sv_file['model'], load_model=True)
         model = _move_model_to_cuda(model)
-        optimizer = _load_optimizer_pair(model, sv_file)
+        model_ocr = _prepare_ocr_model_from_resume(sv_file)
+        optimizer = _load_optimizer_pair(model, sv_file, model_ocr=model_ocr)
         lr_scheduler = _make_scheduler(optimizer, sv_file.get('lr_scheduler'))
         early_stopper = utils.Early_stopping(
             **sv_file.get('early_stopping', config['early_stopper'])
@@ -156,15 +217,19 @@ def prepare_training():
         epoch_start = 1
         model = models.make(config['model'])
         model = _move_model_to_cuda(model)
-        optimizer = _make_optimizer_pair(model)
+        model_ocr = _prepare_ocr_model()
+        optimizer = _make_optimizer_bundle(model, model_ocr=model_ocr)
         lr_scheduler = _make_scheduler(optimizer)
         early_stopper = utils.Early_stopping(**config['early_stopper'])
 
     _log_model_summary(model)
-    return model, optimizer, epoch_start, lr_scheduler, early_stopper
+    if model_ocr is not None:
+        log('model_ocr: #params={}'.format(utils.compute_num_params(model_ocr, text=True)))
+        log('model_ocr: #struct={}'.format(model_ocr))
+    return model, model_ocr, optimizer, epoch_start, lr_scheduler, early_stopper
 
 
-def _save_checkpoint(model, optimizer, epoch, lr_scheduler, early_stopper, save_path, best_model):
+def _save_checkpoint(model, model_ocr, optimizer, epoch, lr_scheduler, early_stopper, save_path, best_model):
     model_g, model_d = _get_model_for_save(model)
     model_spec = copy.deepcopy(config['model'])
 
@@ -192,15 +257,27 @@ def _save_checkpoint(model, optimizer, epoch, lr_scheduler, early_stopper, save_
         optimizer_d_spec['sd'] = optimizer[1].state_dict()
         sv_file['optimizer_g'] = optimizer_g_spec
         sv_file['optimizer_d'] = optimizer_d_spec
+        if len(optimizer) > 2 and config.get('optimizer_ocr') is not None:
+            optimizer_ocr_spec = copy.deepcopy(config['optimizer_ocr'])
+            optimizer_ocr_spec['sd'] = optimizer[2].state_dict()
+            sv_file['optimizer_ocr'] = optimizer_ocr_spec
     else:
-        optimizer_spec = copy.deepcopy(config['optimizer'])
+        optimizer_spec = copy.deepcopy(_get_single_optimizer_spec(config))
         optimizer_spec['sd'] = optimizer.state_dict()
         sv_file['optimizer'] = optimizer_spec
 
+    if model_ocr is not None and config.get('optimizer_ocr') is not None:
+        model_ocr_spec = copy.deepcopy(config['model_ocr'])
+        model_ocr_unwrapped = _unwrap_model(model_ocr)
+        if hasattr(model_ocr_unwrapped, 'get_trainable_state_dict'):
+            model_ocr_spec['trainable_sd'] = model_ocr_unwrapped.get_trainable_state_dict()
+        else:
+            model_ocr_spec['sd'] = model_ocr_unwrapped.state_dict()
+        sv_file['model_ocr'] = model_ocr_spec
+
+    torch.save(sv_file, save_path / Path('epoch-last.pth'))
     if best_model:
         torch.save(sv_file, save_path / Path(f'best_model_Epoch_{epoch}.pth'))
-    else:
-        torch.save(sv_file, save_path / Path('epoch-last.pth'))
 
     epoch_save = config.get('epoch_save')
     if epoch_save is not None and epoch % epoch_save == 0:
@@ -214,8 +291,7 @@ def main(config_, save_path):
 
     log, writer = utils.make_log_writer(save_path)
     train_loader, val_loader = make_dataloaders()
-    model, optimizer, epoch_start, lr_scheduler, early_stopper = prepare_training()
-    model_ocr = _prepare_ocr_model()
+    model, model_ocr, optimizer, epoch_start, lr_scheduler, early_stopper = prepare_training()
     train = train_funcs.make(config['func_train'])
     validation = train_funcs.make(config['func_val'])
     loss_fn = losses.make(config['loss'])
@@ -241,18 +317,29 @@ def main(config_, save_path):
             writer.add_scalar('lr_D', optimizer[1].param_groups[0]['lr'], epoch)
             log_info.append(f"lr_G:{optimizer[0].param_groups[0]['lr']}")
             log_info.append(f"lr_D:{optimizer[1].param_groups[0]['lr']}")
+            if len(optimizer) > 2:
+                writer.add_scalar('lr_OCR', optimizer[2].param_groups[0]['lr'], epoch)
+                log_info.append(f"lr_OCR:{optimizer[2].param_groups[0]['lr']}")
         else:
             writer.add_scalar('lr', optimizer.param_groups[0]['lr'], epoch)
             log_info.append(f"lr:{optimizer.param_groups[0]['lr']}")
 
         config['epoch'] = epoch
-        train_loss = train(train_loader, model, optimizer, loss_fn, [], config, model_ocr)
+        train_out = train(train_loader, model, optimizer, loss_fn, [], config, model_ocr)
+        if isinstance(train_out, tuple):
+            train_loss, train_report = train_out
+        else:
+            train_loss, train_report = train_out, {}
         val_loss, val_report = validation(val_loader, model, loss_fn, [], config, model_ocr)
 
         writer.add_scalar('train_loss', train_loss, epoch)
         writer.add_scalar('val_loss', val_loss, epoch)
         log_info.append(f'train: loss={train_loss:.4f}')
         log_info.append(f'val: loss={val_loss:.4f}')
+        if isinstance(train_report, dict):
+            for key, value in train_report.items():
+                writer.add_scalar(f'train_{key}', value, epoch)
+                log_info.append(f'train_{key}:{value:.4f}')
         if isinstance(val_report, dict):
             for key, value in val_report.items():
                 writer.add_scalar(f'val_{key}', value, epoch)
@@ -268,7 +355,7 @@ def main(config_, save_path):
         log_info.append(f'Early stop {stop} / Best model {best_model}')
 
         _save_checkpoint(
-            model, optimizer, epoch, lr_scheduler, early_stopper, save_path, best_model
+            model, model_ocr, optimizer, epoch, lr_scheduler, early_stopper, save_path, best_model
         )
 
         print(', '.join(log_info))
