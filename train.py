@@ -199,19 +199,34 @@ def prepare_training():
         model = models.make(sv_file['model'], load_model=True)
         model = _move_model_to_cuda(model)
         model_ocr = _prepare_ocr_model_from_resume(sv_file)
-        optimizer = _load_optimizer_pair(model, sv_file, model_ocr=model_ocr)
-        lr_scheduler = _make_scheduler(optimizer, sv_file.get('lr_scheduler'))
-        early_stopper = utils.Early_stopping(
-            **sv_file.get('early_stopping', config['early_stopper'])
+        resume_mode = config.get('resume_mode', 'resume')
+        needs_new_ocr_optimizer = (
+            model_ocr is not None
+            and config.get('optimizer_ocr') is not None
+            and 'optimizer_ocr' not in sv_file
         )
 
-        epoch_start = sv_file['epoch'] + 1
-        state = sv_file.get('state')
-        if state is not None:
-            torch.set_rng_state(state)
+        if resume_mode == 'finetune' or needs_new_ocr_optimizer:
+            optimizer = _make_optimizer_bundle(model, model_ocr=model_ocr)
+            lr_scheduler = _make_scheduler(optimizer)
+            early_stopper = utils.Early_stopping(**config['early_stopper'])
+            epoch_start = 1
+            print(f'Initializing finetune from checkpoint: {config["resume"]}')
+            log(f'Initializing finetune from checkpoint: {config["resume"]}')
+        else:
+            optimizer = _load_optimizer_pair(model, sv_file, model_ocr=model_ocr)
+            lr_scheduler = _make_scheduler(optimizer, sv_file.get('lr_scheduler'))
+            early_stopper = utils.Early_stopping(
+                **sv_file.get('early_stopping', config['early_stopper'])
+            )
 
-        print(f'Resuming from epoch {epoch_start}...')
-        log(f'Resuming from epoch {epoch_start}...')
+            epoch_start = sv_file['epoch'] + 1
+            state = sv_file.get('state')
+            if state is not None:
+                torch.set_rng_state(state)
+
+            print(f'Resuming from epoch {epoch_start}...')
+            log(f'Resuming from epoch {epoch_start}...')
     else:
         print('Training from start...')
         epoch_start = 1
