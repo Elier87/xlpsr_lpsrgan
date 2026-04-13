@@ -317,9 +317,6 @@ def _build_sinc_kernel(kernel_size, cutoff):
 
 def apply_sinc_ringing(image, ringing_cfg, rng):
     image = _normalize_image(image)
-    apply_prob = float(ringing_cfg.get('apply_prob', 0.0))
-    if rng.random() >= apply_prob:
-        return image
 
     kernel_size = _sample_odd_from_range(ringing_cfg['kernel_size_range'], rng)
     cutoff = float(
@@ -333,17 +330,23 @@ def apply_sinc_ringing(image, ringing_cfg, rng):
 
 
 def degrade_one_stage(image, nrcd_cfg, rng):
-    operations = [
-        lambda img: apply_blur(img, nrcd_cfg['blur'], rng),
-        lambda img: apply_resize_stage(img, nrcd_cfg['resize'], rng),
-        lambda img: apply_jpeg_compression(img, nrcd_cfg['jpeg'], rng),
-        lambda img: apply_sinc_ringing(img, nrcd_cfg['ringing'], rng),
-    ]
+    operations = []
 
-    if rng.random() < float(nrcd_cfg['noise']['gaussian_prob']):
+    if rng.random() < float(nrcd_cfg['blur'].get('apply_prob', 1.0)):
+        operations.append(lambda img: apply_blur(img, nrcd_cfg['blur'], rng))
+    if rng.random() < float(nrcd_cfg['resize'].get('apply_prob', 1.0)):
+        operations.append(lambda img: apply_resize_stage(img, nrcd_cfg['resize'], rng))
+    if rng.random() < float(nrcd_cfg['jpeg'].get('apply_prob', 1.0)):
+        operations.append(lambda img: apply_jpeg_compression(img, nrcd_cfg['jpeg'], rng))
+    if rng.random() < float(nrcd_cfg['noise'].get('gaussian_apply_prob', nrcd_cfg['noise'].get('gaussian_prob', 0.0))):
         operations.append(lambda img: apply_gaussian_noise(img, nrcd_cfg['noise'], rng))
-    if rng.random() < float(nrcd_cfg['noise']['poisson_prob']):
+    if rng.random() < float(nrcd_cfg['noise'].get('poisson_apply_prob', nrcd_cfg['noise'].get('poisson_prob', 0.0))):
         operations.append(lambda img: apply_poisson_noise(img, nrcd_cfg['noise'], rng))
+    if rng.random() < float(nrcd_cfg['ringing'].get('apply_prob', 0.0)):
+        operations.append(lambda img: apply_sinc_ringing(img, nrcd_cfg['ringing'], rng))
+
+    if not operations:
+        return _normalize_image(image)
 
     rng.shuffle(operations)
     degraded = _normalize_image(image)

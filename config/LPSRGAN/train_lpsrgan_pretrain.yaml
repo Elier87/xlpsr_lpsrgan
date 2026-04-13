@@ -27,8 +27,8 @@ train_dataset:
     name: ufpr_paired
     args:
       roots:
-        - ./ufpr-sr/UFPR-SR-plates/1920_1080
-        - ./ufpr-sr/UFPR-SR-plates/1280_0960
+        - ./ufpr-sr/UFPR-SR-plates_3/1920_1080
+        - ./ufpr-sr/UFPR-SR-plates_3/1280_0960
       phase: training
   wrapper:
     name: lpsrgan
@@ -46,8 +46,8 @@ val_dataset:
     name: ufpr_paired
     args:
       roots:
-        - ./ufpr-sr/UFPR-SR-plates/1920_1080
-        - ./ufpr-sr/UFPR-SR-plates/1280_0960
+        - ./ufpr-sr/UFPR-SR-plates_3/1920_1080
+        - ./ufpr-sr/UFPR-SR-plates_3/1280_0960
       phase: validation
   wrapper:
     name: lpsrgan
