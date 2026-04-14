@@ -106,14 +106,105 @@ def get_pts(file_path):
         return json.load(j)['shapes'][0]['points']
 
 
+def _sample_projection_offsets(horizontal_angle_deg, vertical_angle_deg):
+    max_ratio_x = float(np.clip(np.tan(np.deg2rad(max(horizontal_angle_deg, 0.0))), 0.0, 0.55))
+    max_ratio_y = float(np.clip(np.tan(np.deg2rad(max(vertical_angle_deg, 0.0))), 0.0, 0.35))
+    if max_ratio_x <= 0 and max_ratio_y <= 0:
+        return None
+
+    left_inset = 0.0
+    right_inset = 0.0
+    top_inset = 0.0
+    bottom_inset = 0.0
+
+    if max_ratio_x > 0:
+        horizontal_mag = random.uniform(0.0, max_ratio_x)
+        if random.random() < 0.5:
+            left_inset = horizontal_mag
+        else:
+            right_inset = horizontal_mag
+
+    if max_ratio_y > 0:
+        vertical_mag = random.uniform(0.0, max_ratio_y)
+        if random.random() < 0.5:
+            top_inset = vertical_mag
+        else:
+            bottom_inset = vertical_mag
+
+    return np.array(
+        [
+            [left_inset, top_inset],
+            [1.0 - right_inset, top_inset],
+            [1.0 - right_inset, 1.0 - bottom_inset],
+            [left_inset, 1.0 - bottom_inset],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _apply_projection_transform(img, mask, normalized_dst, fill_color):
+    if normalized_dst is None:
+        return img, mask
+
+    height, width = img.shape[:2]
+    if height <= 1 or width <= 1:
+        return img, mask
+
+    src = np.array(
+        [
+            [0, 0],
+            [width - 1, 0],
+            [width - 1, height - 1],
+            [0, height - 1],
+        ],
+        dtype=np.float32,
+    )
+    scale = np.array([width - 1, height - 1], dtype=np.float32)
+    dst = normalized_dst * scale
+
+    matrix = cv2.getPerspectiveTransform(src, dst.astype(np.float32))
+    warped_img = cv2.warpPerspective(
+        img,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=fill_color,
+    )
+    warped_mask = cv2.warpPerspective(
+        mask,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return warped_img, warped_mask
+
+
 class _BaseLPWrapper(Dataset):
-    def __init__(self, imgW, imgH, aug, image_aspect_ratio, background, scale=2, dataset=None):
+    def __init__(
+        self,
+        imgW,
+        imgH,
+        aug,
+        image_aspect_ratio,
+        background,
+        scale=2,
+        projection_prob=0.0,
+        projection_horizontal_angle=0.0,
+        projection_vertical_angle=0.0,
+        dataset=None,
+    ):
         self.imgW = imgW
         self.imgH = imgH
         self.scale = scale
         self.aug = aug
         self.ar = image_aspect_ratio
         self.background = eval(background) if isinstance(background, str) else background
+        self.projection_prob = float(projection_prob)
+        self.projection_horizontal_angle = float(projection_horizontal_angle)
+        self.projection_vertical_angle = float(projection_vertical_angle)
         self.dataset = dataset
 
     def __len__(self):
@@ -160,11 +251,23 @@ class SRPairedImageWrapper(_BaseLPWrapper):
         image_aspect_ratio,
         background,
         scale=2,
+        projection_prob=0.0,
+        projection_horizontal_angle=0.0,
+        projection_vertical_angle=0.0,
         rectify=False,
         dataset=None,
     ):
         super().__init__(
-            imgW, imgH, aug, image_aspect_ratio, background, scale=scale, dataset=dataset
+            imgW,
+            imgH,
+            aug,
+            image_aspect_ratio,
+            background,
+            scale=scale,
+            projection_prob=projection_prob,
+            projection_horizontal_angle=projection_horizontal_angle,
+            projection_vertical_angle=projection_vertical_angle,
+            dataset=dataset,
         )
         self.rectify = rectify
         self.transform = self._make_transform()
@@ -178,6 +281,18 @@ class SRPairedImageWrapper(_BaseLPWrapper):
         hr_padded, hr_mask, _, _ = pad_with_mask(
             hr_img, self.ar - 0.15, self.ar + 0.15, color=(127, 127, 127)
         )
+
+        if self.projection_prob > 0 and random.random() < self.projection_prob:
+            normalized_dst = _sample_projection_offsets(
+                self.projection_horizontal_angle,
+                self.projection_vertical_angle,
+            )
+            lr_padded, lr_mask = _apply_projection_transform(
+                lr_padded, lr_mask, normalized_dst, (127, 127, 127)
+            )
+            hr_padded, hr_mask = _apply_projection_transform(
+                hr_padded, hr_mask, normalized_dst, (127, 127, 127)
+            )
 
         augmented = self.transform(
             image=lr_padded, image2=hr_padded, mask=lr_mask, mask2=hr_mask
